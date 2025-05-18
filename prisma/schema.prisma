@@ -1,0 +1,165 @@
+// schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id          String              @id @default(cuid())
+  clerkUserId String              @unique
+  email       String              @unique
+  name        String?
+  imageUrl    String?
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+  scrapes     Scrape[]
+  apiKey      String?             @unique
+  siteConfigs SiteConfiguration[] // Kullanıcının site konfigürasyonları
+}
+
+// Siteye özel veya otomatik tespit edilen seçicileri saklamak için
+model SiteConfiguration {
+  id               String    @id @default(cuid())
+  hostname         String    @unique
+  userId           String? // Hangi kullanıcıya ait olduğu (opsiyonel, genel config olabilir)
+  user             User?     @relation(fields: [userId], references: [id])
+  selectorsJson    Json? // SiteSpecificSelectors objesi
+  lastDiscoveredAt DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+}
+
+model Scrape {
+  id                      String        @id @default(cuid())
+  userId                  String
+  user                    User          @relation(fields: [userId], references: [id])
+  sitemapUrl              String
+  siteHostname            String? // Analiz edilen sitenin hostname'i
+  status                  ScrapeStatus  @default(PENDING)
+  totalUrls               Int?
+  processedUrls           Int?          @default(0)
+  discoveredSelectorsJson Json? // Bu scrape işlemi için kullanılan/keşfedilen seçiciler
+  createdAt               DateTime      @default(now())
+  updatedAt               DateTime      @updatedAt
+  scrapedPages            ScrapedPage[]
+}
+
+enum ScrapeStatus {
+  PENDING
+  DISCOVERING_SELECTORS // Yeni durum
+  PROCESSING_SITEMAP
+  ANALYZING_URLS
+  COMPLETED
+  FAILED
+  PARTIAL
+}
+
+enum ScrapedPageType {
+  PRODUCT
+  BLOG_POST // Blog yazısı için daha spesifik
+  BLOG_INDEX // Blog ana sayfası / listeleme
+  CATEGORY_PAGE
+  STATIC_PAGE
+  UNKNOWN
+  // Diğerleri eklenebilir: COLLECTION, FORUM, SEARCH, ERROR_PAGE vb.
+}
+
+model TrackedProduct {
+  id               String      @id @default(cuid())
+  scrapedPageId    String      @unique
+  scrapedPage      ScrapedPage @relation(fields: [scrapedPageId], references: [id])
+  url              String      @unique
+  userId           String
+  // user          User      @relation(fields: [userId], references: [id]) // Eğer User'a da bağlamak istersen
+  lastPrice        String?
+  lastStock        String? // "Mevcut", "Tükendi" gibi
+  lastCurrencyCode String?
+  isActive         Boolean     @default(true)
+  lastCheckedAt    DateTime    @updatedAt
+  checkInterval    String? // "HOURLY", "DAILY"
+  // ...
+}
+
+model ScrapedPage {
+  id       String @id @default(cuid())
+  scrapeId String
+  scrape   Scrape @relation(fields: [scrapeId], references: [id], onDelete: Cascade)
+  url      String // scrapeId ile birlikte unique olmalı
+
+  // Cheerio/JSON-LD ile çıkarılanlar
+  pageTypeGuess      ScrapedPageType?
+  title              String?
+  metaDescription    String?
+  keywords           String[]
+  ogType             String?
+  ogTitle            String?
+  ogDescription      String?
+  ogImage            String? // Ana OG image URL
+  canonicalUrl       String?
+  price              String? // "123.90"
+  currencySymbol     String? // "₺", "$"
+  stockStatus        String? // "Mevcut", "Tükendi"
+  productCategory    String? // Cheerio'dan ürün için kategori
+  publishDate        DateTime? // Blog için
+  features           String[] // Cheerio'dan özellikler
+  blogPageCategories String[] // Cheerio'dan blog iç kategorileri
+  blogContentSample  String?
+  mainTextContent    String?          @db.Text // Uzun metinler için
+  htmlLang           String?
+
+  // Yapısal veriler JSON olarak
+  jsonLdDataJson      Json? @map("json_ld_data")
+  schemaOrgTypesJson  Json? @map("schema_org_types") // String array
+  imagesJson          Json? // ImageItem[]
+  headingsJson        Json? // Headings objesi
+  allLinksJson        Json? // LinkItem[]
+  internalLinksJson   Json?
+  externalLinksJson   Json?
+  navigationLinksJson Json?
+  footerLinksJson     Json?
+  breadcrumbsJson     Json? // BreadcrumbItem[]
+
+  // AI Tarafından Zenginleştirilmiş/Belirlenmiş Veriler
+  aiDetectedType        ScrapedPageType?
+  aiPageTitle           String?          @db.Text
+  aiMetaDescription     String?          @db.Text
+  aiProductName         String?          @db.Text
+  aiPrice               String?
+  aiCurrencyCode        String? // TRY, USD
+  aiStockStatus         String?
+  aiBrand               String?
+  aiSku                 String?
+  aiShortDescription    String?          @db.Text
+  aiDetailedDescription String?          @db.Text
+  aiFeatures            String[]
+  aiCategories          String[] // AI'ın ürüne/bloga atadığı genel kategoriler
+  aiBlogAuthor          String?
+  aiBlogPublishDate     DateTime?
+  aiBlogSummary         String?          @db.Text
+  aiBlogTags            String[]
+  aiCategoryName        String? // AI'ın kategori sayfası için bulduğu isim
+  aiCategoryDescription String?          @db.Text
+  aiListedItemUrls      String[] // Kategori sayfasındaki ürün/blog linkleri
+  aiStaticPagePurpose   String?
+
+  // Analiz ve Hata Bilgileri
+  fetchMethod       String? // "axios_success", "headless_success_reparsed", "failed"
+  siteSelectorsUsed Boolean? // O site için özel seçici kullanıldı mı?
+  errorMessage      String?   @db.Text
+  processingTimeMs  Int?
+  lastCheckedAt     DateTime? // Periyodik kontrol için
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  trackedProduct TrackedProduct?
+
+  @@unique([scrapeId, url])
+  @@index([pageTypeGuess])
+  @@index([aiDetectedType])
+  @@index([scrapeId])
+}
