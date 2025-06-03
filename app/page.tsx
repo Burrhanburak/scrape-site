@@ -143,7 +143,14 @@ export default function Home() {
         addLogClient(`Seçici tespiti başarılı: ${json.message}`);
         console.log("Keşfedilen Seçiciler:", json.discoveredSelectors || json.selectors);
       } else {
-        setDiscoveryError(json.error || `Seçici tespiti sırasında hata (${res.status})`);
+        let specificError = json.error || `Seçici tespiti sırasında hata (${res.status})`;
+        if (json.isRateLimitError) {
+          specificError = json.error || 'Seçici keşfi için API rate limit aşıldı. Lütfen bekleyip tekrar deneyin.';
+          if (json.retryAfter) {
+              specificError += ` Yaklaşık ${json.retryAfter} saniye sonra deneyebilirsiniz.`;
+          }
+        }
+        setDiscoveryError(specificError);
         logError(json, 'frontend-discoverSelectors-apiError', {url: sitemapInputUrl});
       }
     } catch (err: any) {
@@ -189,6 +196,16 @@ export default function Home() {
         setSitemapUrls(fetchedUrls);
         setProcessedSitemapUrl(actualSitemapForDisplay);
         addLogClient(`${fetchedUrls.length} URL sitemap'ten çekildi: ${actualSitemapForDisplay}`);
+
+        // BURASI ÖNEMLİ: sitemapJson'dan scrapeId'yi alıp set edin
+        if (sitemapJson.scrapeId) {
+          setCurrentScrapeId(sitemapJson.scrapeId);
+          addLogClient(`Current Scrape ID set from sitemap-parser: ${sitemapJson.scrapeId}`);
+        } else {
+          // scrapeId gelmiyorsa bir uyarı loglayabilir veya fallback düşünebilirsiniz
+          addLogClient("Warning: scrapeId was not returned from sitemap-parser.");
+        }
+
       } else {
         setSitemapError(sitemapJson.error || 'Sitemap boş veya URL bulunamadı.');
         setSitemapLoading(false);
@@ -248,13 +265,53 @@ export default function Home() {
         } catch (err: any) {
           addLogClient(`Analiz hatası: ${link} - ${err.message}`);
           logError(err, 'frontend-analyzeUrl-fetch', { url: link });
-          // Hata durumunda döndürülen objeyi ScrapedPageData ile uyumlu hale getirin
+          
+          let errorMessage = 'Analiz başarısız oldu.';
+          let clientErrorType: ScrapedPageData['aiDetectedType'] = 'client_error';
+
+          // API'den dönen JSON hatasını işlemeye çalışalım
+          try {
+            // Check if err.message is a string and contains '{' before trying to parse
+            if (typeof err.message === 'string' && err.message.includes('{')) {
+                const jsonStartIndex = err.message.indexOf('{');
+                const jsonString = err.message.substring(jsonStartIndex);
+                const responseError = JSON.parse(jsonString); 
+                if (responseError.error) {
+                    errorMessage = responseError.error;
+                }
+                if (responseError.isRateLimitError) {
+                    errorMessage = responseError.error || 'API rate limit aşıldı. Lütfen bekleyip tekrar deneyin.';
+                    clientErrorType = 'ai_error_rate_limit'; // Özel bir tip
+                } else if (responseError.error?.toLowerCase().includes('rate limit')) {
+                    clientErrorType = 'ai_error_rate_limit';
+                }
+            } else if (typeof err.message === 'string' && err.message?.toLowerCase().includes('rate limit')) {
+                errorMessage = 'API rate limit aşıldı. Lütfen bekleyip tekrar deneyin.';
+                clientErrorType = 'ai_error_rate_limit';
+            } else if (err.message) {
+                errorMessage = err.message;
+            }
+          } catch (parseErr) {
+            // JSON parse edilemezse veya err.message string değilse, orijinal err.message'ı kullan (string ise)
+            if (typeof err.message === 'string') {
+                if (err.message.toLowerCase().includes('rate limit')) {
+                    errorMessage = 'API rate limit aşıldı. Lütfen bekleyip tekrar deneyin.';
+                    clientErrorType = 'ai_error_rate_limit';
+                } else {
+                    errorMessage = err.message || errorMessage;
+                }
+            } else {
+                 // err.message string değilse genel bir mesaj kullan
+                errorMessage = 'Bilinmeyen bir analiz hatası oluştu.';
+            }
+          }
+
           const errorData: ScrapedPageData = {
             url: link,
-            error: 'Analysis failed',
-            message: err.message,
+            error: errorMessage,
+            message: typeof errorMessage === 'string' ? errorMessage.substring(0,150) : 'Error message not available',
             pageTypeGuess: 'error',
-            aiDetectedType: 'client_error',
+            aiDetectedType: clientErrorType, // Güncellenmiş tip
             title: 'N/A',
             metaDescription: 'N/A',
             price: 'N/A',
@@ -270,8 +327,7 @@ export default function Home() {
             navigationLinks: [], 
             footerLinks: [],
             blogPageCategories: null,
-            aiExtractedData: null, // AI data would not be extracted in case of error
-            // Fallback direct AI fields (if used elsewhere, provide defaults)
+            aiExtractedData: null, 
             aiProductBrand: null,
             aiProductSku: null,
             aiProductShortDescription: null,
@@ -294,6 +350,29 @@ export default function Home() {
     }
     setAnalysisLoading(false);
     addLogClient("Tüm URL analizleri tamamlandı.");
+
+    const rateLimitErrors = analysisResults.filter(r => r.aiDetectedType === 'ai_error_rate_limit').length;
+    if (rateLimitErrors > 0 && urlsToAnalyze.length > 0 && rateLimitErrors / urlsToAnalyze.length > 0.5) { // Örneğin %50'den fazlası rate limit ise
+        setAnalysisError(`Çok sayıda istek API rate limitine takıldı (${rateLimitErrors}/${urlsToAnalyze.length}). Lütfen bekleme sürelerini artırın veya daha sonra tekrar deneyin.`);
+    } else if (rateLimitErrors > 0 && urlsToAnalyze.length > 0) {
+        setAnalysisError(`Bazı istekler (${rateLimitErrors}/${urlsToAnalyze.length}) API rate limitine takıldı. Sonuçlar eksik olabilir.`);
+    }
+
+    // BURASI ÖNEMLİ: Analiz sonuçlarından scrapeId'yi alıp set edin
+    // Use a functional update for setCurrentScrapeId to access the latest currentScrapeId value
+    setCurrentScrapeId(prevScrapeId => {
+      if (!prevScrapeId && analysisResults.length > 0) { // Henüz set edilmediyse ve sonuç varsa
+        const firstResultWithScrapeId = analysisResults.find(r => r && r.scrapeId);
+        if (firstResultWithScrapeId && firstResultWithScrapeId.scrapeId) {
+          addLogClient(`Current Scrape ID set from analysis results: ${firstResultWithScrapeId.scrapeId}`);
+          return firstResultWithScrapeId.scrapeId;
+        } else {
+          addLogClient("Warning: scrapeId was not found in analysis results after completion.");
+          return prevScrapeId; // Keep previous if not found
+        }
+      }
+      return prevScrapeId; // Keep previous if already set or no results
+    });
   };
 
   // This useEffect will populate siteWideNavLinks and siteWideFooterLinks
@@ -333,19 +412,22 @@ export default function Home() {
 
   const totalPages = Math.ceil(filteredAndSortedResults.length / ITEMS_PER_PAGE);
 
-  const filterTypes: { label: string; value: string }[] = [
-    { label: 'Tümü', value: 'all' },
-    { label: 'Ürün', value: 'product' },
-    { label: 'Blog Yazısı', value: 'blogPost' },
-    { label: 'Blog Sayfası', value: 'blog' },
-    { label: 'Kategori Sayfası', value: 'categoryPage' }, // Use 'categoryPage' to match AI
-    { label: 'Genel Sayfa', value: 'page' },
-    { label: 'Bilinmeyen', value: 'unknown' },
-    { label: 'Hata', value: 'error' },
-    { label: 'AI Hatası', value: 'ai_error' },
-    { label: 'Client Hatası', value: 'client_error' },
-  ];
-
+// page.tsx
+const filterTypes: { label: string; value: string }[] = [
+  { label: 'Tümü', value: 'all' },
+  { label: 'Ürün', value: 'product' },
+  { label: 'Blog Yazısı', value: 'blogPost' },
+  { label: 'Blog Sayfası', value: 'blog' },
+  { label: 'Kategori Sayfası', value: 'categoryPage' },
+  { label: 'Statik Sayfa', value: 'staticPage' }, // KVKK vb. için
+  { label: 'Anasayfa/Genel', value: 'page' }, // Anasayfa ve diğer genel sayfalar için tek bir filtre
+  // VEYA ayrı ayrı:
+  // { label: 'Anasayfa', value: 'homepage' },
+  // { label: 'Genel Sayfa', value: 'page' }, 
+  { label: 'Bilinmeyen', value: 'unknown' },
+  { label: 'Hata', value: 'error' },
+  // ...
+];
   const exportToCSV = () => {
     if (filteredAndSortedResults.length === 0) {
       alert("Dışa aktarılacak veri yok.");

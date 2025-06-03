@@ -1,712 +1,714 @@
-// app/api/scrape-ai/route.ts
+// /app/api/scrape-ai/route.ts
 
 import { NextRequest, NextResponse } from 'next/server';
-import axios, { AxiosError } from 'axios'; // AxiosError eklendi
-import { openai, geminiParentInstance, defaultSafetySettings } from '@/lib/ai';
+import { z } from 'zod';
+import LLMScraper from 'llm-scraper';
+import { google, LanguageModel } from '@ai-sdk/google';
+import playwrightAwsLambda from 'playwright-aws-lambda'; // For Vercel/Lambda
+import { chromium as playwrightChromiumLocal, Browser as PlaywrightBrowserType, Page as PlaywrightPageType } from 'playwright'; // For Local
+
 import { addLog, logError } from '@/lib/logger';
 import { withCors } from '@/lib/cors';
-import { extractBaseDataFromHtml, ScrapedPageData, ImageItem, LinkItem } from '@/lib/scraper-utils'; // LinkItem eklendi
-import { getSiteSpecificSelectors, storeSiteSelectors } from '@/lib/config';
-import { URL as NodeURL } from 'url';
-import { Browser } from 'playwright-core';
+import {
+  ScrapedPageData,
+  ImageItem,
+  LinkItem,
+  extractBaseDataFromHtml, // Bu fonksiyon async olmalı ve JSON-LD'yi iyi işlemeli
+  mapCurrencySymbolToCode, // Bu fonksiyonun scraper-utils'de export edildiğinden emin olun
+  resolveUrl, // Eğer resim URL'lerini resolve etmek için kullanılacaksa
+} from '@/lib/scraper-utils';
+import { URL as NodeURL } from 'url'; // siteHostname için
 
-async function callAI(prompt: string, modelPreference: 'gemini' | 'openai' | string, requestId: string, url: string) {
-  let aiResponseJson: any = null;
-  const actualModel = modelPreference === 'gemini' ? 'gemini' : (modelPreference === 'openai' ? 'openai' : 'gemini');
-  addLog(`Using AI model: ${actualModel} for URL: ${url}`, { context: 'ai-call', data: { requestId, model: actualModel } });
 
+// --- API Anahtarı ve LLM İstemcileri ---
+if (!process.env.GOOGLE_GENERATIVE_AI_API_KEY) { // @ai-sdk/google bu değişkeni arar
+  addLog('GOOGLE_GENERATIVE_AI_API_KEY is not set. LLM functionality might be impaired.', {level: 'warn', context: 'api-setup'});
+}
+
+// LLM Instance (Gemini)
+const geminiLlmInstance: LanguageModel = google('models/gemini-1.5-flash-latest'); // Model adını güncel tutun
+
+// LLMScraper Instance
+let llmScraper: LLMScraper | null = null;
+try {
+    // LLMScraper constructor'ı @ai-sdk/google'dan gelen LanguageModel'i kabul etmeli.
+    llmScraper = new LLMScraper(geminiLlmInstance);
+    addLog('LLMScraper initialized successfully with Google Gemini instance.', { context: 'api-setup' });
+} catch (e: any) {
+    logError(e, 'llm-scraper-init-error', { context: 'api-setup', message: "Failed to initialize LLMScraper." });
+}
+
+// Zod şeması (LLMScraper için)
+// /app/api/scrape-ai/route.ts
+// ... diğer importlar
+
+const zodSchemaForLLM = z.object({
+  pageTitle: z.string().optional().describe(
+    "Sayfanın ana, kullanıcı dostu ve en doğru başlığını çıkar. " +
+    "Öncelikle `<title>` etiketine, sonra `<meta property=\"og:title\">` etiketine, sonra sayfadaki ana `<h1>` etiketine bak. " +
+    "Bulamazsan, URL'den anlamlı bir başlık türetmeye çalış. Çok uzunsa kısalt."
+  ),
+  metaDescription: z.string().optional().describe(
+    "Sayfanın SEO uyumlu, bilgilendirici ve öz meta açıklamasını (yaklaşık 150-160 karakter) çıkar. " +
+    "1. Öncelik: `<meta name=\"description\" content=\"...\">` etiketinin içeriği. " +
+    "2. Öncelik: `<meta property=\"og:description\" content=\"...\">` etiketinin içeriği. " +
+    "Eğer bu etiketler yoksa veya içerikleri yetersizse (çok kısa, genel bir mesaj vb.), sayfanın ana içeriğinin ilk 1-2 anlamlı paragrafından uygun bir özet oluştur. " +
+    "Eğer hiç uygun açıklama bulunamazsa bu alanı boş bırak (null döndür)."
+  ),
+  detectedPageType: z.string().optional().describe(
+    "Sayfanın türünü belirle: 'product' (tek bir ürün detayı), 'blogPost' (tek bir makale/haber), " +
+    "'categoryPage' (birden fazla ürün veya makalenin listelendiği kategori/arşiv sayfası), " +
+    "'staticPage' (hakkımızda, iletişim, KVKK gibi sabit içerikli sayfa), 'homepage' (sitenin ana sayfası, genellikle '/' yolu), " +
+    "veya 'unknown' (diğerleri). Sayfadaki ipuçlarına (URL, başlık, içerik yapısı, JSON-LD @type) göre karar ver."
+  ),
+
+  // --- Ürün Sayfası İçin Alanlar ---
+  productName: z.string().optional().describe(
+    "Eğer sayfa bir 'product' ise, ürünün tam ve doğru adını çıkar. Genellikle `<h1>` içinde veya belirgin bir ürün başlığı alanında bulunur."
+  ),
+  price: z.string().optional().describe(
+    "Eğer sayfa bir 'product' ise, ürünün fiyatını sayısal bir string olarak (örn: \"123.99\", \"1500.00\") çıkar. " +
+    "Para birimi sembolünü veya kodunu dahil etme, onu 'currency' alanına yaz. Ondalık ayracı olarak nokta (.) kullan."
+  ),
+  currency: z.string().optional().describe(
+    "Eğer sayfa bir 'product' ise ve fiyat bulunduysa, fiyatın para birimi kodunu (örn: \"TRY\", \"USD\", \"EUR\") çıkar. " +
+    "Sayfadaki sembollerden (₺, $, €) veya metinlerden (TL, Dolar, Euro) bunu belirle."
+  ),
+  stockStatus: z.string().optional().describe(
+    "Eğer sayfa bir 'product' ise, stok durumunu belirle. " +
+    "Sayfada 'Stokta Var', 'Mevcut', 'Tükendi', 'Stokta Yok', 'Ön Sipariş', 'Yakında Gelecek', 'Sepete Ekle' gibi ifadeler/butonlar ara. " +
+    "Bulunan duruma göre 'Mevcut', 'Tükendi', 'Ön Sipariş' gibi standart bir değer döndür. " +
+    "Eğer 'Sepete Ekle' butonu aktif ve başka bir bilgi yoksa 'Mevcut' kabul et. Bilgi bulunamazsa null bırak."
+  ),
+  productBrand: z.string().optional().describe(
+    "Eğer sayfa bir 'product' ise, ürünün markasını (üretici veya satıcı marka) çıkar. Genellikle ürün adı yakınında veya ürün detaylarında belirtilir."
+  ),
+  productSku: z.string().optional().describe(
+    "Eğer sayfa bir 'product' ise, ürünün SKU (Stok Kodu Birimi), MPN (Üretici Parça Numarası) veya benzersiz ürün kodunu çıkar."
+  ),
+  productFeatures: z.array(z.string()).optional().describe(
+    "Eğer sayfa bir 'product' ise, ürünün temel özelliklerini bir liste olarak çıkar. " +
+    "Her bir özellik 'Özellik Adı: Değer' formatında (örn: 'Renk: Kırmızı', 'Malzeme: Pamuk') veya sadece özellik metni olabilir. " +
+    "Genellikle 'Ürün Özellikleri', 'Teknik Detaylar' gibi başlıklar altında listelenir."
+  ),
+  productCategories: z.array(z.string()).optional().describe(
+    "Eğer sayfa bir 'product' ise, ürünün ait olduğu kategorileri bir liste olarak çıkar. " +
+    "Genellikle breadcrumb (sayfa yolu) navigasyonundan (örn: 'Anasayfa > Giyim > Kadın > Elbise' ise ['Giyim', 'Kadın', 'Elbise'] gibi) veya ürün başlığına yakın belirtilen kategorilerden al. En spesifik kategoriden en genele doğru sırala."
+  ),
+  productImages: z.array(z.string()).optional().describe(
+    "Eğer sayfa bir 'product' ise, ürünün ana ve en iyi kalitedeki 1 ila 3 adet görselinin TAM ve GEÇERLİ URL'lerini çıkar. " +
+    "Bunlar http:// veya https:// ile başlamalıdır. Küçük thumbnail'ler yerine ana ürün görsellerini tercih et."
+  ),
+
+  // --- Blog Yazısı İçin Alanlar ---
+  postTitle: z.string().optional().describe(
+    "Eğer sayfa bir 'blogPost' (makale/haber) ise, yazının tam ve dikkat çekici başlığını çıkar."
+  ),
+  author: z.string().optional().describe(
+    "Eğer sayfa bir 'blogPost' ise ve belirtilmişse, yazının yazarının adını çıkar."
+  ),
+  publishDate: z.string().optional().describe(
+    "Eğer sayfa bir 'blogPost' ise, yazının yayın tarihini 'YYYY-MM-DD' formatında çıkar. " +
+    "Sayfadaki tarih bilgisini bu formata dönüştürmeye çalış."
+  ),
+  blogSummary: z.string().optional().describe(
+    "Eğer sayfa bir 'blogPost' ise, yazının ana fikrini veren, yaklaşık 2-4 cümlelik kısa ve etkili bir özetini oluştur. " +
+    "Yazının giriş paragraflarından veya en önemli kısımlarından faydalan."
+  ),
+  blogCategories: z.array(z.string()).optional().describe(
+    "Eğer sayfa bir 'blogPost' ise, yazının ait olduğu kategorileri bir liste olarak çıkar. " +
+    "Genellikle yazı başında veya sonunda belirtilir."
+  ),
+  blogTags: z.array(z.string()).optional().describe(
+    "Eğer sayfa bir 'blogPost' ise, yazıya atanmış etiketleri (keywords) bir liste olarak çıkar."
+  ),
+  blogImages: z.array(z.string()).optional().describe(
+    "Eğer sayfa bir 'blogPost' ise, yazı içeriğiyle en alakalı 1-2 adet ana görselin TAM ve GEÇERLİ URL'lerini çıkar. " +
+    "Bunlar http:// veya https:// ile başlamalıdır."
+  ),
+
+  // --- Kategori Sayfası İçin Alanlar ---
+  categoryName: z.string().optional().describe(
+    "Eğer sayfa bir 'categoryPage' (ürün/makale listeleme sayfası) ise, bu kategorinin adını çıkar. Genellikle sayfa başlığında (H1) belirtilir."
+  ),
+  categoryDescription: z.string().optional().describe(
+    "Eğer sayfa bir 'categoryPage' ise ve varsa, kategori hakkında genel bilgi veren kısa bir açıklama metni çıkar."
+  ),
+// /api/scrape-ai/route.ts -> zodSchemaForLLM içinde
+detectedPageType: z.string().optional().describe(
+  "Sayfanın türünü belirle: 'product' (tek bir ürün detayı), 'blogPost' (tek bir makale/haber), " +
+  "'categoryPage' (birden fazla ürün veya makalenin listelendiği kategori/arşiv sayfası), " +
+  "'staticPage' (hakkımızda, iletişim, KVKK gibi sabit içerikli sayfa), " +
+  "'homepage' (sitenin ana sayfası, genellikle URL yolu sadece '/' olur), " + // homepage eklendi
+  "veya 'unknown' (diğerleri). Sayfadaki ipuçlarına (URL, başlık, içerik yapısı, JSON-LD @type) göre karar ver."
+),
+  // --- Statik Sayfa İçin Alanlar ---
+  // (staticPage için Zod şemasına özel alanlar eklenebilir veya pageTitle/metaDescription yeterli olabilir)
+  // staticPagePurpose: z.string().optional().describe("Eğer 'staticPage' ise, sayfanın amacını kısaca belirt (örn: 'Şirket tanıtımı', 'Kullanıcı sözleşmesi', 'İletişim bilgileri').")
+
+}).catchall(z.any()); // Şemada olmayan ama LLM'in bulduğu diğer alanları da al (opsiyonel)
+
+// --- Kendi AI Çağrı Fonksiyonunuz (Gemini için) ---
+async function callCustomGeminiAI(prompt: string, requestId: string, urlForLog: string): Promise<any | null> {
+  addLog(`[CustomAI] Attempting to call Gemini for URL: ${urlForLog}`, { context: 'custom-ai-call', data: { requestId, promptLength: prompt.length } });
   try {
-    if (actualModel === 'gemini') {
-      const modelInstance = geminiParentInstance.getGenerativeModel({
-        model: "gemini-1.5-flash-latest",
-      });
-      const result = await modelInstance.generateContent(prompt);
-      const response = result.response;
-      const textContent = await response.text();
-      const jsonMatch = textContent.match(/```json\s*([\s\S]*?)\s*```|({[\s\S]*})/);
-      if (jsonMatch && (jsonMatch[1] || jsonMatch[2])) {
-        try {
-            aiResponseJson = JSON.parse(jsonMatch[1] || jsonMatch[2]);
-        } catch (parseError: any) {
-            logError(parseError, 'ai-call-gemini-json-parse-error', { data: { requestId, url, rawText: textContent.slice(0,500) } });
-            aiResponseJson = { detectedPageType: 'unknown', error: 'Gemini response JSON parsing failed.', partialResponse: textContent.slice(0, 500) };
-        }
-      } else {
-        logError(new Error('No JSON block found in Gemini response'), 'ai-call-gemini-no-json-block', { data: { requestId, url, preview: textContent.slice(0, 500) } });
-        aiResponseJson = { detectedPageType: 'unknown', error: 'Gemini response did not contain a recognizable JSON block.', partialResponse: textContent.slice(0, 500) };
+    const { response } = await geminiModelForCustomAI.generate({ prompt });
+    const textResponse = response.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    if (textResponse) {
+      addLog(`[CustomAI] Gemini raw response received for ${urlForLog}. Length: ${textResponse.length}`, { context: 'custom-ai-call', data: { requestId } });
+      // Yanıtın JSON formatında olup olmadığını kontrol et
+      let jsonData = null;
+      try {
+        // Temizleme: Başı ve sonundaki ```json ... ``` işaretlerini kaldır
+        const cleanedResponse = textResponse.replace(/^```json\s*|```\s*$/g, '').trim();
+        jsonData = JSON.parse(cleanedResponse);
+        addLog(`[CustomAI] Gemini response parsed successfully for ${urlForLog}`, { context: 'custom-ai-call', data: { requestId, parsedDataPreview: JSON.stringify(jsonData).substring(0, 200) } });
+        return jsonData;
+      } catch (parseError: any) {
+        logError(parseError, 'custom-ai-json-parse-error', {
+          context: 'custom-ai-call',
+          data: { requestId, url: urlForLog, rawResponse: textResponse.substring(0, 500), message: parseError.message }
+        });
+        // JSON parse hatası durumunda, ham metni veya bir hata objesini döndürebiliriz.
+        // Şimdilik, AI'nın düzgün formatta yanıt vermediğini belirten bir hata objesi döndürelim.
+        return { error: "AI response was not valid JSON.", rawResponse: textResponse.substring(0, 1000) };
       }
-    } else { 
-      const completion = await openai.chat.completions.create({
-        model: 'gpt-4o-mini', 
-        messages: [{ role: 'user', content: prompt }],
-        temperature: 0.1,
-        response_format: { type: "json_object" },
-      });
-      const content = completion.choices[0].message.content;
-      if (content) {
-        try {
-          aiResponseJson = JSON.parse(content);
-        } catch (e) {
-          logError(e as Error, 'ai-call-openai-json', { data: { requestId, url, rawResponse: content.slice(0,500) } });
-          aiResponseJson = { detectedPageType: 'unknown', error: 'OpenAI response JSON parsing failed despite JSON mode.', rawContent: content.slice(0,500) };
-        }
-      } else {
-        aiResponseJson = { detectedPageType: 'unknown', error: 'OpenAI response was empty.' };
-      }
-    }
-  } catch (err: any) {
-    logError(err, `ai-call-${actualModel}-api-error`, { data: { requestId, url, message: err.message, stack: err.stack?.substring(0, 1000) } });
-    aiResponseJson = { detectedPageType: 'unknown', error: `AI API Error (${actualModel}): ${err.message}` };
-  }
-  return aiResponseJson;
-}
-
-function mapCurrencySymbolToCode(symbol?: string | null): string | null {
-  if (!symbol) return null;
-  const map: Record<string, string> = {
-    '₺': 'TRY', '$': 'USD', '€': 'EUR', '£': 'GBP', '¥': 'JPY', '₹': 'INR', '₽': 'RUB', '₩': 'KRW', 'TL': 'TRY',
-    'eur': 'EUR', 'usd': 'USD', 'gbp': 'GBP', 'try': 'TRY', 'cad': 'CAD', 'aud': 'AUD',
-  };
-  const trimmedSymbol = symbol.trim().toLowerCase();
-  for (const key in map) {
-    if (trimmedSymbol.includes(key.toLowerCase())) {
-        return map[key];
-    }
-  }
-  if (trimmedSymbol.length === 3 && /^[a-z]+$/.test(trimmedSymbol)) {
-    return trimmedSymbol.toUpperCase();
-  }
-  return null;
-}
-
-function resolveUrlHelper(url: string | undefined | null, baseUrl: string): string | null {
-  if (!url) return null;
-  try {
-    const parsedUrl = new URL(url);
-    if (parsedUrl.protocol) return url;
-  } catch (_) {
-    // relative URL
-  }
-  try {
-    const base = new URL(baseUrl);
-    if (url.startsWith('//')) return base.protocol + url;
-    return new URL(url, base).toString();
-  } catch (e) {
-    return null;
-  }
-}
-async function runAutoSelectorDiscoveryIfNeeded(siteUrl: string, hostname: string, requestId: string): Promise<void> {
-  addLog(`[API] Auto-selector discovery check for ${hostname}`, { context: 'auto-selector', data: { requestId, siteUrl } });
-  try {
-    const existingSelectors = await getSiteSpecificSelectors(hostname);
-    if (!existingSelectors || Object.keys(existingSelectors).length < 5) {
-      addLog(`[API] Triggering auto-selector discovery for ${hostname} as few/no selectors found. (Placeholder - actual discovery logic needed)`, { context: 'auto-selector', data: { requestId, hostname } });
-      // Gerçek discover-site-selectors çağrısı burada olmalı (eğer frontend'den ayrıca çağrılmıyorsa)
     } else {
-      addLog(`[API] Sufficient selectors likely exist for ${hostname}. Skipping auto-discovery.`, { context: 'auto-selector', data: { requestId, hostname } });
+      addLog(`[CustomAI] Gemini returned no text response for ${urlForLog}`, { context: 'custom-ai-call', data: { requestId }, level: 'warn' });
+      return { error: "AI returned no text response." };
     }
-  } catch (e: any) {
-    logError(e, 'auto-selector-discovery-error', { context: 'auto-selector', data: { hostname, requestId, message: e.message } });
+  } catch (error: any) {
+    logError(error, 'custom-ai-gemini-call-exception', {
+      context: 'custom-ai-call',
+      data: { requestId, url: urlForLog, message: error.message, stack: error.stack?.substring(0, 300) }
+    });
+    return { error: `Custom AI (Gemini) call failed: ${error.message}` };
   }
 }
 
-function safeParseFloat(value: string | undefined | null): number | null {
-    if (value === null || value === undefined || typeof value !== 'string') {
-        return null;
+// --- Veritabanı Kayıt Fonksiyonu ---
+async function mapAndSaveScrapedData(data: ScrapedPageData, scrapeIdParam: string, requestId: string): Promise<void> {
+    // operationStage'i burada tanımlamıyoruz, çünkü bu fonksiyon POST handler'ın context'inde çağrılıyor
+    // ve operationStage orada yönetiliyor. Eğer bu fonksiyon bağımsız çalışacaksa, kendi operationStage'i olmalı.
+    const publishDateObj = data.publishDate ? new Date(data.publishDate) : null;
+    let aiPublishDateObj: Date | null = null;
+    if (data.aiExtractedData?.blogPostInfo?.publishDate) {
+        const parsedDate = new Date(data.aiExtractedData.blogPostInfo.publishDate);
+        if (!isNaN(parsedDate.getTime())) {
+            aiPublishDateObj = parsedDate;
+        }
     }
-    const cleanedValue = value.replace(',', '.').replace(/[^\d.-]/g, '');
-    const num = parseFloat(cleanedValue);
-    return isNaN(num) ? null : num;
+
+    const toPrismaPageType = (typeStr?: string | null): PrismaScrapedPageType | null => {
+        if (!typeStr) return PrismaScrapedPageType.UNKNOWN; // veya null, modelinize bağlı
+        const upperType = typeStr.toUpperCase().replace(/-/g, '_').replace(/ /g, '_');
+        if (Object.values(PrismaScrapedPageType).includes(upperType as PrismaScrapedPageType)) {
+            return upperType as PrismaScrapedPageType;
+        }
+        // Daha esnek eşleme
+        if (upperType.includes('PRODUCT')) return PrismaScrapedPageType.PRODUCT;
+        if (upperType.includes('BLOG') || upperType.includes('ARTICLE') || upperType.includes('POST')) return PrismaScrapedPageType.BLOG_POST;
+        if (upperType.includes('CATEGORY') || upperType.includes('LISTING')) return PrismaScrapedPageType.CATEGORY_PAGE;
+        if (upperType.includes('STATIC') || upperType.includes('PAGE')) return PrismaScrapedPageType.STATIC_PAGE; // 'PAGE' -> STATIC_PAGE
+        if (upperType.includes('HOME')) return PrismaScrapedPageType.HOMEPAGE;
+        
+        addLog(`[DB Save] Unknown page type string for Prisma: '${typeStr}', mapped to UNKNOWN.`, { context: 'db-save-mapping', data: { requestId, originalType: typeStr }, level: 'warn' });
+        return PrismaScrapedPageType.UNKNOWN;
+    };
+
+    const prismaData = {
+        scrapeId: scrapeIdParam,
+        url: data.url!,
+        
+        pageTypeGuess: toPrismaPageType(data.pageTypeGuess),
+        title: data.title?.substring(0, 255),
+        metaDescription: data.metaDescription?.substring(0, 500),
+        keywords: data.keywords || [],
+        ogType: data.ogType?.substring(0, 100),
+        ogTitle: data.ogTitle?.substring(0, 255),
+        ogDescription: data.ogDescription?.substring(0, 500),
+        ogImage: data.ogImage?.substring(0, 1024),
+        canonicalUrl: data.canonicalUrl?.substring(0, 1024),
+        htmlLang: data.htmlLang?.substring(0, 20),
+        metaRobots: data.metaRobots?.substring(0, 255),
+        price: data.price, // Decimal type in Prisma
+        currencySymbol: data.currencySymbol?.substring(0, 10),
+        stockStatus: data.stockStatus?.substring(0, 50),
+        productCategory: data.productCategory?.substring(0, 255),
+        publishDate: (publishDateObj && !isNaN(publishDateObj.getTime())) ? publishDateObj : null,
+        features: data.features || [],
+        blogPageCategories: data.blogCategories || [],
+        blogContentSample: data.blogContentSample?.substring(0, 1000),
+        mainTextContent: data.mainTextContent, // Text type in Prisma
+        
+        jsonLdDataJson: data.jsonLdData || null, // JSON type in Prisma
+        schemaOrgTypesJson: data.schemaOrgTypes ? JSON.stringify(data.schemaOrgTypes) : null,
+        imagesJson: data.images || null, // JSON type in Prisma
+        headingsJson: data.headings || null, // JSON type in Prisma
+        allLinksJson: data.allLinks || null, // JSON type in Prisma
+        internalLinksJson: data.internalLinks || null, // JSON type in Prisma
+        externalLinksJson: data.externalLinks || null, // JSON type in Prisma
+        navigationLinksJson: data.navigationLinks || null, // JSON type in Prisma
+        footerLinksJson: data.footerLinks || null, // JSON type in Prisma
+        breadcrumbsJson: data.breadcrumbs || null, // JSON type in Prisma
+
+        aiDetectedType: toPrismaPageType(data.aiDetectedType),
+        aiPageTitle: data.aiExtractedData?.pageTitle?.substring(0, 255) || data.title?.substring(0,255),
+        aiMetaDescription: data.aiExtractedData?.metaDescription?.substring(0, 500) || data.metaDescription?.substring(0,500),
+        aiProductName: data.aiExtractedData?.productInfo?.productName?.substring(0, 255),
+        aiPrice: data.aiExtractedData?.productInfo?.price, // Decimal
+        aiCurrencyCode: data.aiExtractedData?.productInfo?.currency?.substring(0,10) || data.currencyCode?.substring(0,10),
+        aiStockStatus: data.aiExtractedData?.productInfo?.stockStatus?.substring(0,50) || data.stockStatus?.substring(0,50),
+        aiBrand: data.aiExtractedData?.productInfo?.brand?.substring(0,100) || data.aiProductBrand?.substring(0,100),
+        aiSku: data.aiExtractedData?.productInfo?.sku?.substring(0,100) || data.aiProductSku?.substring(0,100),
+        aiShortDescription: data.aiExtractedData?.productInfo?.shortDescription?.substring(0, 500), // Assuming a field exists
+        aiDetailedDescription: data.aiExtractedData?.productInfo?.detailedDescription, // Text type
+        aiFeatures: data.aiExtractedData?.productInfo?.features || [],
+        aiCategories: data.aiExtractedData?.productInfo?.categoriesFromPage || data.aiExtractedData?.blogPostInfo?.categoriesFromPage || [],
+        aiBlogAuthor: data.aiExtractedData?.blogPostInfo?.author?.substring(0,100) || data.author?.substring(0,100),
+        aiBlogPublishDate: (aiPublishDateObj && !isNaN(aiPublishDateObj.getTime())) ? aiPublishDateObj : ((publishDateObj && !isNaN(publishDateObj.getTime())) ? publishDateObj : null),
+        aiBlogSummary: data.aiExtractedData?.blogPostInfo?.summary, // Text type
+        aiBlogTags: data.aiExtractedData?.blogPostInfo?.tags || data.blogTags || [],
+        aiCategoryName: data.aiExtractedData?.categoryPageInfo?.categoryName?.substring(0, 255),
+        aiCategoryDescription: data.aiExtractedData?.categoryPageInfo?.description, // Text type
+        aiListedItemUrls: (data.aiExtractedData?.categoryPageInfo as any)?.listedItemUrls || [],
+        aiStaticPagePurpose: data.aiExtractedData?.staticPageInfo?.pagePurpose?.substring(0, 500),
+
+        fetchMethod: data.fetchMethod?.substring(0,50),
+        siteSelectorsUsed: data.siteSelectorsUsed, // JSON type
+        errorMessage: data.error?.substring(0,1000) || data.message?.substring(0,1000),
+        lastCheckedAt: new Date(),
+    };
+    
+    // operationStage = 'prisma-upsert-scrapedpage'; // Set by caller
+    await prisma.scrapedPage.upsert({
+        where: { scrapeId_url: { scrapeId: scrapeIdParam, url: data.url! } },
+        create: prismaData,
+        update: { ...prismaData, updatedAt: new Date() },
+    });
+
+    // operationStage = 'prisma-update-scrape-session'; // Set by caller
+    await prisma.scrape.update({
+        where: { id: scrapeIdParam },
+        data: {
+            processedUrls: { increment: 1 },
+            updatedAt: new Date(),
+            status: 'PROCESSING', // Keep status as processing until all URLs are done
+        },
+    });
+    addLog(`[API] ScrapedPage data saved/updated in DB for URL: ${data.url}, ScrapeID: ${scrapeIdParam}`, { context: 'db-save', data: { requestId }});
 }
 
 
+// --- MAIN POST HANDLER ---
 export const POST = withCors(async function POST(req: NextRequest) {
   const requestId = Math.random().toString(36).substring(2, 10);
-  let playwrightBrowser: Browser | null = null;
-  let operationStage = 'init';
-  let requestUrlForError = 'unknown_url'; // Hata durumunda URL'yi loglamak için
+  let operationStage = 'init'; 
+  let requestUrlForError = 'unknown_url';
+  let browser: PlaywrightBrowserType | null = null;
+  let pwPage: PlaywrightPageType | null = null;
+  let htmlContentForCheerio: string | null = null; 
+  let fetchMethod = 'playwright_pending';
+  let fetchErrorDetail: string | null = null;
+  let scrapeIdFromRequest: string | null = null;
+
 
   try {
-    operationStage = 'loading-playwright-modules';
-    let browserModule;
-    let playwrightInstance;
-
-    if (process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.VERCEL_ENV === 'production') {
-        addLog('[API] Loading playwright-aws-lambda for Vercel/Lambda environment.', { context: 'scrape-ai-post-setup', data: { requestId } });
-        browserModule = await import('playwright-aws-lambda');
-        playwrightInstance = browserModule.chromium;
-    } else {
-        addLog('[API] Loading playwright for local environment.', { context: 'scrape-ai-post-setup', data: { requestId } });
-        browserModule = await import('playwright');
-        playwrightInstance = browserModule.chromium;
-    }
-
     operationStage = 'parsing-request-json';
-    const {
-      url,
-      model: preferredAiModel = 'gemini',
-      useHeadlessOverride = false,
-      autoDiscoverSelectors = false
-    } = await req.json();
+    const { url, scrapeId } = await req.json();
+    scrapeIdFromRequest = scrapeId; // Store for global error handler
     requestUrlForError = url || 'unknown_url_from_request';
 
-
     if (!url) {
-      addLog('[API] Missing URL parameter', { level: 'error', context: 'scrape-ai-post', data: { requestId } });
-      return NextResponse.json({ error: 'URL gerekli', pageTypeGuess: 'client_error', aiDetectedType: 'client_error', url: requestUrlForError }, { status: 400 });
+      addLog('[API] Missing URL parameter', { level: 'error', data: { requestId } });
+      return NextResponse.json({ url: requestUrlForError, scrapeId, error: 'URL gerekli', pageTypeGuess: 'client_error', aiDetectedType: 'client_error', title: 'N/A' } as ScrapedPageData, { status: 400 });
     }
-    addLog(`[API] Processing URL: ${url}`, { context: 'scrape-ai-post', data: { requestId, url, model: preferredAiModel, useHeadlessOverride, autoDiscoverSelectors } });
-
-    operationStage = 'hostname-extraction';
-    const siteHostname = new NodeURL(url).hostname;
-
-    if (autoDiscoverSelectors && siteHostname) {
-      operationStage = 'auto-selector-discovery';
-      await runAutoSelectorDiscoveryIfNeeded(url, siteHostname, requestId);
+    if (!scrapeId) {
+      addLog('[API] Missing scrapeId parameter', { level: 'error', data: { requestId, url } });
+      return NextResponse.json({ url, scrapeId: null, error: 'scrapeId gerekli', pageTypeGuess: 'client_error', aiDetectedType: 'client_error', title: 'N/A' } as ScrapedPageData, { status: 400 });
     }
+    addLog(`[API] Processing URL: ${url} for Scrape ID: ${scrapeId} (CustomAI Main)`, { context: 'scrape-ai-post', data: { requestId, url, scrapeId } });
 
-    let htmlContent: string | null = null;
-    let fetchMethod = 'axios_pending';
-    let axiosFetchError: string | null = null;
-
-    operationStage = 'axios-fetch-attempt';
+    // Adım 1: Playwright ile Sayfa Alma
+    operationStage = 'playwright-launch-navigate';
     try {
-      addLog(`[API] Attempting Axios fetch for ${url}`, {context: 'axios-fetch', data: {requestId}});
-      const response = await axios.get(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36 SIT-Scraper/1.2', // Güncel bir UA
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-          'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
-          'Referer': `https://${siteHostname}/` // Referer eklemek önemli olabilir
-         },
-        timeout: 15000,
-      });
-      if (response.data && typeof response.data === 'string' && response.data.trim().length > 0 && response.status === 200) {
-          htmlContent = response.data;
-          fetchMethod = 'axios_success';
-          addLog(`[API] Axios fetch successful for ${url}. Status: ${response.status}, HTML length: ${htmlContent.length}`, {context: 'axios-fetch', data: {requestId, status: response.status}});
-      } else {
-          axiosFetchError = `Axios returned status ${response.status || 'N/A'} or empty/invalid data. Length: ${response.data?.length || 0}`;
-          addLog(`[API] Axios fetch for ${url} problematic. ${axiosFetchError}`, {context: 'axios-fetch', data: {requestId, status: response.status}, level: 'warn'});
-          fetchMethod = 'axios_failed_empty_or_bad_status';
-      }
-    } catch (error: any) {
-      const err = error as AxiosError; // Tip ataması
-      axiosFetchError = err.message;
-      if (err.response) {
-        axiosFetchError += ` (Status: ${err.response.status})`;
-        const errorResponseDataPreview = err.response.data ? (typeof err.response.data === 'string' ? err.response.data.substring(0,200) : JSON.stringify(err.response.data).substring(0,200)) : 'N/A';
-        addLog(`[API] Axios error response data preview: ${errorResponseDataPreview}`, {context: 'axios-fetch-error-debug', data: {requestId}});
-      }
-      logError(err, 'axios-fetch-error', {context: 'axios-fetch', data: {requestId, url, message: axiosFetchError}});
-      addLog(`[API] Axios fetch FAILED for ${url}. Error: ${axiosFetchError}`, {context: 'axios-fetch', data: {requestId}, level:'warn'});
-      fetchMethod = 'axios_failed_exception';
-    }
+        let launchOptions: Parameters<typeof playwrightChromiumLocal.launch>[0] = { headless: true };
+        let browserContextImpl: typeof playwrightChromiumLocal | typeof playwrightAwsLambda = playwrightChromiumLocal;
 
-    operationStage = 'initial-cheerio-parse';
-    let baseData: Partial<ScrapedPageData> = { url, error: axiosFetchError, message: axiosFetchError ? axiosFetchError.substring(0,150) : null };
-    if (htmlContent) {
-        baseData = await extractBaseDataFromHtml(htmlContent, url); // Artık async
-        baseData.url = url; // extractBaseDataFromHtml'in url'yi koruduğundan emin olalım
-    } else {
-        baseData.pageTypeGuess = 'error';
-        baseData.message = axiosFetchError || 'No HTML content from Axios.';
-        addLog(`[API] No HTML from Axios for Cheerio analysis of ${url}. Error: ${baseData.message}`, {context: 'cheerio-parse', data: {requestId}, level: 'warn'});
-    }
-
-    operationStage = 'headless-decision';
-    let useEffectiveHeadless = useHeadlessOverride;
-    const cheerioContentLength = baseData.mainTextContent?.length || 0;
-    const cheerioFoundTitle = !!baseData.title && baseData.title !== 'Başlık Yok' && baseData.title.trim() !== '' && !baseData.title.startsWith(url);
-    const cheerioFoundPriceForProduct = baseData.pageTypeGuess === 'product' && !!baseData.price && parseFloat(String(baseData.price).replace(/[^0-9.,]/g, '').replace(',', '.')) > 0;
-
-    if (!useEffectiveHeadless) {
-      if (fetchMethod.startsWith('axios_failed')) {
-          addLog(`[API] Axios failed, attempting Headless for ${url} as a fallback.`, {context: 'headless-decision', data: {requestId}});
-          useEffectiveHeadless = true;
-      } else if (htmlContent) {
-          if (!baseData.title || baseData.title === "Başlık Yok" || baseData.title === url || cheerioContentLength < 300) {
-              addLog(`[API] Cheerio found generic title or very little content (${cheerioContentLength} chars, Title: "${baseData.title}") for ${url}. Will try Headless.`, {context: 'headless-decision', data: {requestId, pageType: baseData.pageTypeGuess}});
-              useEffectiveHeadless = true;
-          } else if (baseData.pageTypeGuess === 'product' && (!cheerioFoundTitle || !cheerioFoundPriceForProduct)) {
-              addLog(`[API] Cheerio missed essential product data (title: ${cheerioFoundTitle}, price: ${cheerioFoundPriceForProduct}) for ${url}. Will try Headless.`, {context: 'headless-decision', data: {requestId}});
-              useEffectiveHeadless = true;
-          } else if (baseData.pageTypeGuess === 'unknown' && cheerioContentLength < 800) {
-               addLog(`[API] Cheerio guessed 'unknown' with little content (${cheerioContentLength} chars) for ${url}. Will try Headless.`, {context: 'headless-decision', data: {requestId}});
-              useEffectiveHeadless = true;
-          }
-      } else if (!htmlContent) {
-          addLog(`[API] No HTML content from Axios, MUST attempt Headless for ${url}.`, {context: 'headless-decision', data: {requestId}});
-          useEffectiveHeadless = true;
-      }
-    }
-
-    let headlessErrorDetail: string | null = null;
-    if (useEffectiveHeadless) {
-      operationStage = 'headless-fetch-attempt';
-      try {
-        addLog(`[Headless] Launching browser for: ${url}`, {context: 'headless-fetch', data: {requestId}});
-        playwrightBrowser = await playwrightInstance.launch({ headless: true });
+        if (process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.VERCEL_ENV === 'production') {
+            addLog('[API] Initializing Playwright for Vercel/Lambda environment.', { context: 'playwright-setup', data: { requestId } });
+            browserContextImpl = playwrightAwsLambda;
+            // const executablePath = await playwrightAwsLambda.executablePath();
+            // if (executablePath) launchOptions.executablePath = executablePath;
+        } else {
+            addLog('[API] Initializing Playwright for local environment.', { context: 'playwright-setup', data: { requestId } });
+        }
         
-        if (!playwrightBrowser) { throw new Error('Failed to launch Playwright browser instance.'); }
-
-        const context = await playwrightBrowser.newContext({
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36 SIT-Scraper-Playwright/1.2',
+        if (typeof browserContextImpl.launch !== 'function') {
+            logError(new Error('Selected Playwright context does not have a launch function.'), 'playwright-launch-method-missing', {
+                context: 'playwright-setup',
+                isLambda: !!(process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.VERCEL_ENV === 'production')
+            });
+            throw new Error('Playwright launch method not found in the selected context.');
+        }
+        
+        addLog('[API] Launching browser...', { context: 'playwright-setup', data: { launchOptions } });
+        browser = await browserContextImpl.launch(launchOptions);
+        
+        const context = await browser.newContext({
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 SIT-Scraper/2.3',
             javaScriptEnabled: true,
             ignoreHTTPSErrors: true,
-            viewport: { width: 1366, height: 768 }
+            viewport: { width: 1280, height: 800 },
         });
-        const page = await context.newPage();
+        pwPage = await context.newPage();
         
-        await page.route('**/*', (route, request) => {
-            const resourceType = request.resourceType();
-            const requestUrl = request.url().toLowerCase();
-            if (['image', 'stylesheet', 'font', 'media', 'other'].includes(resourceType) &&
-                !requestUrl.includes('sitemap') && // sitemap.xml gibi dosyaları engelleme
-                !requestUrl.endsWith('.js') && // JS dosyalarını engelleme (render için önemli olabilir)
-                !requestUrl.includes('json') // API çağrılarını engelleme
-            ) {
-                 route.abort();
-            } else {
-                 route.continue();
-            }
-        });
-        
-        addLog(`[Headless] Navigating to ${url}`, {context: 'headless-fetch', data: {requestId}});
-        const pwResponse = await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
-        
-        if (!pwResponse) { throw new Error('Playwright page.goto returned null response.'); }
-        addLog(`[Headless] Navigation response status: ${pwResponse.status()} for ${url}`, {context: 'headless-fetch', data: {requestId}});
+        addLog(`[API] Playwright navigating to ${url}`, {context: 'playwright-fetch', data: {requestId}});
+        const pwResponse = await pwPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
 
-        if (pwResponse.status() !== 200) {
-            const bodyForError = await page.content();
-            addLog(`[Headless] Non-200 HTML Preview (first 300 chars): ${bodyForError.substring(0,300)}`, {context: 'headless-fetch-error-debug', data: {requestId}});
-            throw new Error(`Playwright navigation failed with status: ${pwResponse.status()}`);
-        }
-
-        await page.waitForTimeout(2500 + Math.random() * 2000);
-
-        const newHtmlContent = await page.content();
-        addLog(`[Headless] Playwright HTML Preview (first 300 chars): ${newHtmlContent.substring(0,300)}`, {context: 'headless-fetch-debug', data: {requestId}});
-
-        if (newHtmlContent && (newHtmlContent.length > (htmlContent?.length || 0) + 200 || !htmlContent) ) {
-          htmlContent = newHtmlContent;
-          baseData = await extractBaseDataFromHtml(htmlContent, url);
-          baseData.url = url; // Tekrar ata
-          fetchMethod = 'headless_success_reparsed';
-          baseData.error = null; 
-          baseData.message = null;
-          addLog(`[Headless] Successfully fetched and reparsed with Headless for ${url}. New HTML length: ${htmlContent.length}`, {context: 'headless-fetch', data: {requestId}});
+        if (pwResponse && pwResponse.ok()) {
+            htmlContentForCheerio = await pwPage.content();
+            fetchMethod = 'playwright_success_page_ready';
+            addLog(`[API] Playwright page ready. HTML Length: ${htmlContentForCheerio?.length}`, {context: 'playwright-fetch', data: {requestId}});
         } else {
-          fetchMethod = htmlContent ? 'headless_no_significant_change' : 'headless_empty_content';
-          addLog(`[Headless] Fetched with Headless for ${url}, but content not significantly changed or still short. Headless length: ${newHtmlContent?.length || 0}. Using previous Cheerio parse.`, {context: 'headless-fetch', data: {requestId}, level:'info'});
+            const status = pwResponse?.status();
+            fetchErrorDetail = `Playwright navigation failed with status: ${status || 'unknown'}`;
+            addLog(`[API] Playwright navigation FAILED. Status: ${status}`, {context: 'playwright-fetch', data: {requestId, status}, level: 'warn'});
+            fetchMethod = 'playwright_failed_navigation';
         }
-      } catch (headlessError: any) {
-        headlessErrorDetail = headlessError.message;
-        logError(headlessError, 'headless-browser-error', {context: 'headless-fetch', data: {requestId, url, message: headlessErrorDetail}});
-        addLog(`[Headless] Browser fetch/parse FAILED for ${url}. Error: ${headlessErrorDetail}. Using previous data (if any).`, {context: 'headless-fetch', data: {requestId}, level:'error'});
-        fetchMethod = 'headless_failed';
-        if (!baseData.error) { 
-            baseData.error = `Headless fetch failed: ${headlessErrorDetail}`;
-            baseData.message = `Headless: ${headlessErrorDetail.substring(0,120)}`;
-            baseData.pageTypeGuess = 'error';
+    } catch (error: any) {
+        fetchErrorDetail = error.message;
+        logError(error, 'playwright-launch-navigate-exception', { context: 'playwright-fetch', data: { requestId, url, message: error.message, stack: error.stack?.substring(0, 500) } });
+        fetchMethod = 'playwright_failed_exception';
+    }
+    // pwPage açık kalabilir eğer AI onu kullanacaksa, ama bizim custom AI HTML alıyor.
+    // Bu yüzden burada kapatabiliriz veya AI sonrası. Şimdilik açık bırakalım, AI sonrası kapatalım.
+
+    // Adım 2: Cheerio ile Temel Veri Çıkarma (JSON-LD dahil)
+    operationStage = 'cheerio-base-extraction';
+    let baseData: Partial<ScrapedPageData> = {
+      url,
+      scrapeId,
+      fetchMethod,
+      error: fetchErrorDetail,
+      message: fetchErrorDetail ? fetchErrorDetail.substring(0, 150) : null,
+      images: [], navigationLinks: [], footerLinks: [], breadcrumbs: [], jsonLdData: [], schemaOrgTypes: [],
+    };
+
+    if (htmlContentForCheerio && !fetchErrorDetail) {
+      try {
+        const cheerioData = await extractBaseDataFromHtml(htmlContentForCheerio, url!);
+        baseData = { ...baseData, ...cheerioData };
+        baseData.url = url; // Ensure URL is still set
+        baseData.scrapeId = scrapeId; // Ensure scrapeId is still set
+        if (baseData.error && !fetchErrorDetail) { // If Cheerio found an error not caught by Playwright
+            fetchErrorDetail = baseData.error as string;
+            baseData.message = baseData.message || (typeof baseData.error === 'string' ? baseData.error.substring(0,150) : "Cheerio error");
         }
-      } finally {
-        operationStage = 'headless-closing';
-        if (playwrightBrowser) {
-          await playwrightBrowser.close();
-          playwrightBrowser = null;
-          addLog('[Headless] Browser closed for ' + url, {context: 'headless-fetch', data: {requestId}});
+        if (baseData.jsonLdData && baseData.jsonLdData.length > 0) {
+            addLog(`[API] JSON-LD data found by Cheerio: ${baseData.jsonLdData.length} items.`, { context: 'cheerio-extraction', data: { requestId } });
         }
+      } catch (cheerioError: any) {
+        logError(cheerioError, 'cheerio-extraction-exception', { context: 'cheerio-base-extraction', data: { requestId, url, message: cheerioError.message } });
+        baseData.error = baseData.error || `Cheerio extraction failed: ${cheerioError.message}`;
+        baseData.message = baseData.message || `Cheerio: ${cheerioError.message.substring(0,120)}`;
+      }
+    } else {
+      baseData.pageTypeGuess = baseData.pageTypeGuess || (fetchErrorDetail ? 'error' : 'unknown');
+      baseData.title = baseData.title || (fetchErrorDetail ? "İçerik Alınamadı" : "Başlık Yok");
+      if (!baseData.error && !htmlContentForCheerio) {
+        baseData.error = "No HTML content obtained from Playwright for Cheerio processing.";
+        baseData.message = "No HTML for Cheerio.";
       }
     }
-    
-    operationStage = 'final-data-assembly';
-    if (!baseData.url) baseData.url = url;
 
-    let finalData: ScrapedPageData = {
-        url: baseData.url || url,
-        pageTypeGuess: baseData.pageTypeGuess || (baseData.error ? 'error' : 'unknown'),
-        title: baseData.title,
-        metaDescription: baseData.metaDescription,
+    // Adım 3: Kendi Gemini AI Çağrınız ile Veri Zenginleştirme
+    let customAiExtractedData: any = null;
+    let aiDetectedTypeByCustomAI: ScrapedPageData['aiDetectedType'] = baseData.pageTypeGuess as ScrapedPageData['aiDetectedType']; // Başlangıçta Cheerio'dan
+    
+    const canRunCustomAI = htmlContentForCheerio && !baseData.error && 
+                           (baseData.mainTextContent && baseData.mainTextContent.length > 100 || htmlContentForCheerio.length > 500);
+
+    if (canRunCustomAI) {
+        operationStage = 'custom-ai-extraction-prompt-prepare';
+        // AI için prompt oluşturma
+        // Zod şemasındaki tanımları kullanarak bir prompt oluşturabiliriz.
+        // Örnek: "Aşağıdaki HTML içeriğinden şu bilgileri JSON formatında çıkar: sayfa başlığı, meta açıklama, sayfa türü (product, blogPost, categoryPage, staticPage, homepage, unknown)..."
+        // Daha iyi sonuçlar için, HTML'in tamamı yerine önemli kısımlarını (örn. <head>, ana içerik alanı) gönderebilirsiniz.
+        // Şimdilik basitleştirilmiş bir prompt:
+        const simplifiedHtmlForPrompt = htmlContentForCheerio!.substring(0, 25000); // Gemini limitlerini göz önünde bulundurun
+        const aiPrompt = `
+          Analyze the following HTML content from the URL ${url} and extract the specified information in JSON format.
+          Focus on accuracy and completeness based on the content.
+          
+          HTML Content (partial):
+          \`\`\`html
+          ${simplifiedHtmlForPrompt}
+          \`\`\`
+
+          JSON Output Structure:
+          {
+            "pageTitle": "string (The main, user-friendly title. Prioritize <title>, then og:title, then H1. If very long, shorten it.)",
+            "metaDescription": "string (SEO-friendly meta description, ~150-160 chars. Prioritize <meta description>, then og:description. If not found or insufficient, summarize from main content. Null if no suitable description.)",
+            "detectedPageType": "string ('product', 'blogPost', 'categoryPage', 'staticPage', 'homepage', 'unknown'. Decide based on URL, title, content structure, JSON-LD @type.)",
+            "productInfo": {
+              "productName": "string (If 'product', the full product name.)",
+              "price": "string (If 'product', numeric price string, e.g., '123.99'. No currency symbol/code.)",
+              "currency": "string (If 'product' and price found, currency code, e.g., 'TRY', 'USD'.)",
+              "stockStatus": "string (If 'product', e.g., 'Mevcut', 'Tükendi', 'Ön Sipariş'. Null if not found.)",
+              "brand": "string (If 'product', the brand name.)",
+              "sku": "string (If 'product', SKU or MPN.)",
+              "features": ["string (If 'product', list of key features, e.g., 'Color: Red' or just feature text.)"],
+              "categoriesFromPage": ["string (If 'product', categories from breadcrumbs or near title. Specific to general.)"],
+              "images": ["string (If 'product', 1-3 main, high-quality, FULL and VALID image URLs starting with http/https.)"],
+              "shortDescription": "string (If 'product', a brief summary of the product, 1-2 sentences.)",
+              "detailedDescription": "string (If 'product', more extensive description if available.)"
+            },
+            "blogPostInfo": {
+              "postTitle": "string (If 'blogPost', the full title of the article.)",
+              "author": "string (If 'blogPost', author's name.)",
+              "publishDate": "string (If 'blogPost', publication date in 'YYYY-MM-DD' format.)",
+              "summary": "string (If 'blogPost', a 2-4 sentence summary.)",
+              "categoriesFromPage": ["string (If 'blogPost', categories the post belongs to.)"],
+              "tags": ["string (If 'blogPost', tags or keywords.)"],
+              "images": ["string (If 'blogPost', 1-2 relevant, FULL and VALID image URLs starting with http/https.)"]
+            },
+            "categoryPageInfo": {
+              "categoryName": "string (If 'categoryPage', name of the category.)",
+              "description": "string (If 'categoryPage', a short description of the category.)",
+              "listedItemUrls": ["string (If 'categoryPage', list a few full URLs of items listed on this page, if easily identifiable.)"]
+            },
+            "staticPageInfo": {
+              "pagePurpose": "string (If 'staticPage', briefly describe the page's purpose, e.g., 'Company information', 'Contact details'.)"
+            }
+          }
+          If a field is not applicable or data cannot be found, omit the field or set its value to null where appropriate for strings, or an empty array for arrays.
+          For 'productInfo', 'blogPostInfo', 'categoryPageInfo', 'staticPageInfo', only include the object if detectedPageType matches.
+        `;
+        
+        operationStage = 'custom-ai-extraction-call';
+        customAiExtractedData = await callCustomGeminiAI(aiPrompt, requestId, url);
+
+        if (customAiExtractedData && !customAiExtractedData.error) {
+          aiDetectedTypeByCustomAI = customAiExtractedData.detectedPageType || baseData.pageTypeGuess;
+          addLog(`[API] CustomAI successfully extracted data. Type: ${aiDetectedTypeByCustomAI}`, { context: 'custom-ai-extraction', data: { requestId, extractedDataPreview: JSON.stringify(customAiExtractedData).substring(0,200) }});
+        } else if (customAiExtractedData?.error) {
+          addLog(`[API] CustomAI returned an error: ${customAiExtractedData.error}`, { context: 'custom-ai-extraction', data: { requestId, errorDetail: customAiExtractedData.rawResponse?.substring(0,300) }, level: 'warn' });
+          // Don't overwrite baseData.error if AI fails, but log it.
+        } else {
+          addLog(`[API] CustomAI call returned no data or an unhandled error.`, { context: 'custom-ai-extraction', data: { requestId }, level: 'warn' });
+        }
+    } else {
+        addLog(`[API] Skipping CustomAI for ${url} due to: ${!htmlContentForCheerio ? 'No HTML' : (baseData.error ? `previous error: ${baseData.error}` : 'insufficient content')}.`, { context: 'custom-ai-skip', data: { requestId, error: baseData.error } });
+    }
+
+    // Playwright sayfasını ve tarayıcıyı AI çağrısından sonra kapatabiliriz (eğer AI HTML kullanıyorsa)
+    if (pwPage) { try { await pwPage.close(); pwPage = null; } catch (e) { addLog(`Error closing Playwright page post-AI: ${(e as Error).message}`, {level: 'warn', context: 'playwright-cleanup', data: {requestId}}) } }
+    if (browser) { 
+        try { await browser.close(); browser = null;
+            addLog('[API] Playwright browser closed post-AI.', { context: 'playwright-cleanup', data: { requestId } }); 
+        } catch (e) { 
+            addLog(`Error closing Playwright browser post-AI: ${(e as Error).message}`, { level: 'warn', context: 'playwright-cleanup', data: { requestId } }); 
+        }
+    }
+
+
+    // Adım 4: Verileri Birleştirme (Cheerio/JSON-LD + CustomAI)
+    operationStage = 'final-data-assembly';
+    // Öncelik: Custom AI > JSON-LD (baseData içinde) > Cheerio (baseData içinde)
+    const finalAiDetectedTypeActual = customAiExtractedData?.detectedPageType || baseData.pageTypeGuess;
+
+    let jsonLdProductInfo: any = null;
+    let jsonLdBlogPostInfo: any = null;
+    if (baseData.jsonLdData) {
+        jsonLdProductInfo = baseData.jsonLdData.find(item => item['@type'] === 'Product' || (Array.isArray(item['@type']) && item['@type'].includes('Product')));
+        jsonLdBlogPostInfo = baseData.jsonLdData.find(item => item['@type'] === 'BlogPosting' || (Array.isArray(item['@type']) && item['@type'].includes('BlogPosting')) || item['@type'] === 'Article');
+    }
+    
+    let finalDetectedTypeForApiResponse = finalAiDetectedTypeActual; 
+    if (finalDetectedTypeForApiResponse === 'staticPage') {
+        finalDetectedTypeForApiResponse = 'page'; 
+    }
+
+
+    const finalData: ScrapedPageData = {
+        url: baseData.url!,
+        scrapeId: scrapeId,
+        pageTypeGuess: baseData.pageTypeGuess, // Cheerio's initial guess
+        title: customAiExtractedData?.pageTitle || baseData.title,
+        metaDescription: (customAiExtractedData?.metaDescription && customAiExtractedData.metaDescription.toLowerCase() !== 'null' && customAiExtractedData.metaDescription.trim() !== "") 
+                         ? customAiExtractedData.metaDescription 
+                         : baseData.metaDescription,
         keywords: baseData.keywords,
         ogType: baseData.ogType,
-        ogTitle: baseData.ogTitle,
-        ogDescription: baseData.ogDescription,
-        ogImage: baseData.ogImage,
-        mainTextContent: baseData.mainTextContent,
+        ogTitle: customAiExtractedData?.pageTitle || jsonLdProductInfo?.name || jsonLdBlogPostInfo?.headline || baseData.ogTitle,
+        ogDescription: (customAiExtractedData?.metaDescription && customAiExtractedData.metaDescription.toLowerCase() !== 'null' && customAiExtractedData.metaDescription.trim() !== "")
+                         ? customAiExtractedData.metaDescription
+                         : (jsonLdProductInfo?.description || jsonLdBlogPostInfo?.description || baseData.ogDescription),
+        ogImage: baseData.ogImage || (Array.isArray(jsonLdProductInfo?.image) ? jsonLdProductInfo.image[0]?.url || jsonLdProductInfo.image[0] : (jsonLdProductInfo?.image?.url || jsonLdProductInfo?.image)) || (Array.isArray(jsonLdBlogPostInfo?.image) ? jsonLdBlogPostInfo.image[0]?.url || jsonLdBlogPostInfo.image[0] : (jsonLdBlogPostInfo?.image?.url || jsonLdBlogPostInfo?.image)),
+        canonicalUrl: baseData.canonicalUrl,
+        htmlLang: baseData.htmlLang,
+        metaRobots: baseData.metaRobots,
+        jsonLdData: baseData.jsonLdData,
+        schemaOrgTypes: baseData.schemaOrgTypes,
         headings: baseData.headings,
-        images: baseData.images || [],
         allLinks: baseData.allLinks,
         internalLinks: baseData.internalLinks,
         externalLinks: baseData.externalLinks,
-        price: baseData.price,
-        currencySymbol: baseData.currencySymbol,
-        currencyCode: baseData.currencyCode,
-        stockStatus: baseData.stockStatus,
-        category: baseData.category,
-        breadcrumbs: baseData.breadcrumbs,
-        jsonLdData: baseData.jsonLdData,
-        schemaOrgTypes: baseData.schemaOrgTypes,
-        features: baseData.features,
-        date: baseData.date,
-        publishDate: baseData.publishDate,
-        author: baseData.author,
-        blogCategories: baseData.blogCategories,
-        blogTags: baseData.blogTags,
-        blogContentSample: baseData.blogContentSample,
-        productBrand: baseData.productBrand,
-        productSku: baseData.productSku,
-        productAvailability: baseData.productAvailability,
-        productCondition: baseData.productCondition,
-        productGtin: baseData.productGtin,
-        productMpn: baseData.productMpn,
-        productColor: baseData.productColor,
-        productSize: baseData.productSize,
-        productMaterial: baseData.productMaterial,
-        productRatingValue: safeParseFloat(baseData.productRatingValue as any),
-        productReviewCount: safeParseFloat(baseData.productReviewCount as any),
-        productOffers: baseData.productOffers,
-        socialLinks: baseData.socialLinks,
-        contactInfo: baseData.contactInfo,
-        language: baseData.language,
-        favicon: baseData.favicon,
-        canonicalUrl: baseData.canonicalUrl,
-        ampUrl: baseData.ampUrl,
-        videoUrls: baseData.videoUrls,
-        audioUrls: baseData.audioUrls,
-        formFields: baseData.formFields,
-        tableData: baseData.tableData,
-        rawHtmlLength: baseData.rawHtmlLength ?? htmlContent?.length ?? 0,
-        cleanedTextLength: baseData.mainTextContent?.length || 0,
-        fetchTimestamp: new Date().toISOString(),
-        processingTimeMs: 0, // This can be calculated later
-        htmlLang: baseData.htmlLang,
-        metaRobots: baseData.metaRobots,
-        
-        // JSON-LD specific fields from baseData
-        jsonLdProductOffers: baseData.jsonLdProductOffers,
-        jsonLdAuthor: baseData.jsonLdAuthor,
-        jsonLdPublisher: baseData.jsonLdPublisher,
-        jsonLdRating: baseData.jsonLdRating,
-        jsonLdReviews: baseData.jsonLdReviews,
-        jsonLdItemCondition: baseData.jsonLdItemCondition,
-        jsonLdAvailability: baseData.jsonLdAvailability,
-        jsonLdColor: baseData.jsonLdColor,
-        jsonLdSize: baseData.jsonLdSize,
-        jsonLdMaterial: baseData.jsonLdMaterial,
-        jsonLdGtin: baseData.jsonLdGtin,
-        jsonLdMpn: baseData.jsonLdMpn,
-        jsonLdBrand: baseData.jsonLdBrand,
-        jsonLdSku: baseData.jsonLdSku,
-        jsonLdCategories: baseData.jsonLdCategories,
-        jsonLdBreadcrumbs: baseData.jsonLdBreadcrumbs,
-        jsonLdImage: baseData.jsonLdImage,
-        jsonLdDescription: baseData.jsonLdDescription,
-        jsonLdName: baseData.jsonLdName,
-        jsonLdUrl: baseData.jsonLdUrl,
-        jsonLdPrice: baseData.jsonLdPrice,
-        jsonLdPriceCurrency: baseData.jsonLdPriceCurrency,
-        jsonLdInLanguage: baseData.jsonLdInLanguage,
-        jsonLdDatePublished: baseData.jsonLdDatePublished,
-        jsonLdDateModified: baseData.jsonLdDateModified,
-        jsonLdHeadline: baseData.jsonLdHeadline,
-        jsonLdKeywords: baseData.jsonLdKeywords,
-        jsonLdArticleBody: baseData.jsonLdArticleBody,
-        jsonLdArticleSection: baseData.jsonLdArticleSection,
-        jsonLdWordCount: baseData.jsonLdWordCount,
-        jsonLdMainEntityOfPage: baseData.jsonLdMainEntityOfPage,
-        jsonLdIsPartOf: baseData.jsonLdIsPartOf,
-        jsonLdAbout: baseData.jsonLdAbout,
-        jsonLdMentions: baseData.jsonLdMentions,
-        jsonLdAudience: baseData.jsonLdAudience,
-        jsonLdCreator: baseData.jsonLdCreator,
-        jsonLdContributor: baseData.jsonLdContributor,
-        jsonLdEditor: baseData.jsonLdEditor,
-        jsonLdProvider: baseData.jsonLdProvider,
-        jsonLdSourceOrganization: baseData.jsonLdSourceOrganization,
-        jsonLdCopyrightHolder: baseData.jsonLdCopyrightHolder,
-        jsonLdCopyrightYear: baseData.jsonLdCopyrightYear,
-        jsonLdVersion: baseData.jsonLdVersion,
-        jsonLdLicense: baseData.jsonLdLicense,
-        jsonLdExpires: baseData.jsonLdExpires,
-        jsonLdIsAccessibleForFree: baseData.jsonLdIsAccessibleForFree,
-        jsonLdHasPart: baseData.jsonLdHasPart,
-        jsonLdExampleOfWork: baseData.jsonLdExampleOfWork,
-        jsonLdLearningResourceType: baseData.jsonLdLearningResourceType,
-        jsonLdEducationalUse: baseData.jsonLdEducationalUse,
-        jsonLdTypicalAgeRange: baseData.jsonLdTypicalAgeRange,
-        jsonLdInteractivityType: baseData.jsonLdInteractivityType,
-        jsonLdAccessMode: baseData.jsonLdAccessMode,
-        jsonLdAccessModeSufficient: baseData.jsonLdAccessModeSufficient,
-        jsonLdAccessibilityFeature: baseData.jsonLdAccessibilityFeature,
-        jsonLdAccessibilityHazard: baseData.jsonLdAccessibilityHazard,
-        jsonLdAccessibilitySummary: baseData.jsonLdAccessibilitySummary,
-        jsonLdAccessibilityAPI: baseData.jsonLdAccessibilityAPI,
-        jsonLdAccessibilityControl: baseData.jsonLdAccessibilityControl,
-        jsonLdAdditionalType: baseData.jsonLdAdditionalType,
-        jsonLdAlternateName: baseData.jsonLdAlternateName,
-        jsonLdDisambiguatingDescription: baseData.jsonLdDisambiguatingDescription,
-        jsonLdIdentifier: baseData.jsonLdIdentifier,
-        jsonLdSameAs: baseData.jsonLdSameAs,
-        jsonLdSubjectOf: baseData.jsonLdSubjectOf,
-        jsonLdPotentialAction: baseData.jsonLdPotentialAction,
-        
         navigationLinks: baseData.navigationLinks,
         footerLinks: baseData.footerLinks,
-
-        aiProductBrand: baseData.aiProductBrand, // Carries over if baseData has it
-        aiProductSku: baseData.aiProductSku,
-        aiBlogAuthor: baseData.aiBlogAuthor,
-        aiBlogTags: baseData.aiBlogTags,
+        breadcrumbs: baseData.breadcrumbs,
+        mainTextContent: baseData.mainTextContent,
         siteSelectorsUsed: baseData.siteSelectorsUsed,
-
-        aiDetectedType: undefined,
-        aiExtractedData: undefined,
-        error: baseData.error || (fetchMethod.includes('failed') ? (headlessErrorDetail || axiosFetchError || 'Fetch failed') : null),
-        message: baseData.message || (fetchMethod.includes('failed') ? (headlessErrorDetail || axiosFetchError || 'Fetch failed').substring(0,150) : null),
         fetchMethod: fetchMethod,
-    };
+        error: baseData.error || customAiExtractedData?.error, // Prioritize base error, then AI error
+        message: baseData.message || (customAiExtractedData?.error ? String(customAiExtractedData.error).substring(0,150) : null),
+        rawHtmlLength: htmlContentForCheerio?.length || baseData.rawHtmlLength,
+        aiDetectedType: finalDetectedTypeForApiResponse || (baseData.error ? 'error' : (customAiExtractedData?.error ? 'ai_error' : 'unknown')),
+        aiExtractedData: customAiExtractedData && !customAiExtractedData.error ? {
+            detectedPageType: finalDetectedTypeForApiResponse || 'unknown',
+            pageTitle: customAiExtractedData.pageTitle,
+            metaDescription: (customAiExtractedData.metaDescription === "null" || customAiExtractedData.metaDescription === "") ? null : customAiExtractedData.metaDescription,
+            productInfo: (finalAiDetectedTypeActual === 'product' && customAiExtractedData.productInfo) ? customAiExtractedData.productInfo : null,
+            blogPostInfo: (finalAiDetectedTypeActual === 'blogPost' && customAiExtractedData.blogPostInfo) ? customAiExtractedData.blogPostInfo : null,
+            categoryPageInfo: (finalAiDetectedTypeActual === 'categoryPage' && customAiExtractedData.categoryPageInfo) ? customAiExtractedData.categoryPageInfo : null,
+            staticPageInfo: (finalAiDetectedTypeActual === 'staticPage' && customAiExtractedData.staticPageInfo) ? customAiExtractedData.staticPageInfo : null,
+        } : (baseData.error ? { detectedPageType: 'error', error: baseData.error as string } 
+            : (customAiExtractedData?.error ? { detectedPageType: 'ai_error', error: String(customAiExtractedData.error) } 
+            : (baseData.jsonLdData && (jsonLdProductInfo || jsonLdBlogPostInfo) ? { 
+                detectedPageType: jsonLdProductInfo ? 'product' : (jsonLdBlogPostInfo ? 'blogPost' : 'unknown_jsonld'),
+                pageTitle: jsonLdProductInfo?.name || jsonLdBlogPostInfo?.headline,
+                metaDescription: jsonLdProductInfo?.description || jsonLdBlogPostInfo?.description,
+            } : null))),
+        
+        price: customAiExtractedData?.productInfo?.price || jsonLdProductInfo?.offers?.[0]?.price || jsonLdProductInfo?.offers?.price || baseData.price,
+        currencySymbol: baseData.currencySymbol,
+        currencyCode: customAiExtractedData?.productInfo?.currency || jsonLdProductInfo?.offers?.[0]?.priceCurrency || jsonLdProductInfo?.offers?.priceCurrency || baseData.currencyCode,
+        stockStatus: (customAiExtractedData?.productInfo?.stockStatus && customAiExtractedData.productInfo.stockStatus.toLowerCase() !== 'null' && customAiExtractedData.productInfo.stockStatus.trim() !== "")
+                     ? customAiExtractedData.productInfo.stockStatus 
+                     : jsonLdProductInfo?.offers?.[0]?.availability?.replace('http://schema.org/', '').replace('InStock', 'Mevcut').replace('OutOfStock', 'Tükendi') || 
+                       jsonLdProductInfo?.offers?.availability?.replace('http://schema.org/', '').replace('InStock', 'Mevcut').replace('OutOfStock', 'Tükendi') || 
+                       baseData.stockStatus,
+        category: null, 
+        productCategory: null, 
+        publishDate: (finalAiDetectedTypeActual === 'blogPost' ? (customAiExtractedData?.blogPostInfo?.publishDate || jsonLdBlogPostInfo?.datePublished) : null) || baseData.publishDate || baseData.date,
+        features: (finalAiDetectedTypeActual === 'product' ? (customAiExtractedData?.productInfo?.features || jsonLdProductInfo?.additionalProperty?.map((p:any) => `${p.name || p.propertyID || 'Özellik'}: ${p.value}`)) : null) || baseData.features,
+        blogCategories: null, 
+        blogPageCategories: null, 
+        blogContentSample: (finalAiDetectedTypeActual === 'blogPost' ? (customAiExtractedData?.blogPostInfo?.summary || jsonLdBlogPostInfo?.description) : null) || baseData.blogContentSample,
+        aiProductBrand: (finalAiDetectedTypeActual === 'product' ? (customAiExtractedData?.productInfo?.brand || jsonLdProductInfo?.brand?.name) : null) || baseData.aiProductBrand,
+        aiProductSku: (finalAiDetectedTypeActual === 'product' ? (customAiExtractedData?.productInfo?.sku || jsonLdProductInfo?.sku || jsonLdProductInfo?.mpn) : null) || baseData.aiProductSku,
+        aiBlogAuthor: (finalAiDetectedTypeActual === 'blogPost' ? (customAiExtractedData?.blogPostInfo?.author || jsonLdBlogPostInfo?.author?.name || (Array.isArray(jsonLdBlogPostInfo?.author) ? jsonLdBlogPostInfo.author[0]?.name : null)) : null) || baseData.author || baseData.aiBlogAuthor,
+        aiBlogTags: (finalAiDetectedTypeActual === 'blogPost' ? (customAiExtractedData?.blogPostInfo?.tags || (Array.isArray(jsonLdBlogPostInfo?.keywords) ? jsonLdBlogPostInfo.keywords : (jsonLdBlogPostInfo?.keywords || '').split(',').map((k:string) => k.trim()).filter(Boolean))) : null) || baseData.blogTags || baseData.aiBlogTags,
+        aiCategoryDescription: (finalAiDetectedTypeActual === 'categoryPage' ? (customAiExtractedData?.categoryPageInfo?.description) : null) || baseData.aiCategoryDescription,
+        images: [...(baseData.images || [])],
+      };
 
-    if (finalData.error && (!finalData.title || finalData.title === 'Başlık Yok' || finalData.title === url)) {
-        finalData.aiDetectedType = 'client_error';
-        finalData.pageTypeGuess = 'error';
-        addLog(`[API] Fetch ultimately failed for ${url}. Error: ${finalData.error}. Returning error state.`, {context:'final-error-check', data: {requestId}, level: 'error'});
-        return NextResponse.json(finalData);
-    }
+    // Kategori ve Ürün Kategorisi için birleştirme
+    finalData.category = baseData.category || 
+                         (customAiExtractedData?.productInfo?.categoriesFromPage && Array.isArray(customAiExtractedData.productInfo.categoriesFromPage) ? customAiExtractedData.productInfo.categoriesFromPage.join(', ') : null) ||
+                         (customAiExtractedData?.blogPostInfo?.categoriesFromPage && Array.isArray(customAiExtractedData.blogPostInfo.categoriesFromPage) ? customAiExtractedData.blogPostInfo.categoriesFromPage.join(', ') : null);
 
-    operationStage = 'ai-analysis-decision';
-    let perform_AI_analysis = false;
-    let ai_task_description = "";
-    const currentBestPageTypeFromFinalData = finalData.pageTypeGuess;
+    finalData.productCategory = (finalAiDetectedTypeActual === 'product' && customAiExtractedData?.productInfo?.categoriesFromPage && Array.isArray(customAiExtractedData.productInfo.categoriesFromPage) && customAiExtractedData.productInfo.categoriesFromPage.length > 0)
+                                ? customAiExtractedData.productInfo.categoriesFromPage.join(' > ') 
+                                : baseData.productCategory;
 
-    if (!currentBestPageTypeFromFinalData || currentBestPageTypeFromFinalData === 'unknown' || currentBestPageTypeFromFinalData === 'error') {
-      if (finalData.mainTextContent && finalData.mainTextContent.length > 150) {
-        perform_AI_analysis = true;
-        ai_task_description = "Bu sayfanın TÜRÜNÜ (product, blogPost, categoryPage, staticPage, unknown) KESİNLEŞTİR ve bu türe uygun TEMEL BİLGİLERİ (başlık, meta açıklama, varsa fiyat/kategori/tarih gibi) çıkar.";
-      }
-    } else if (currentBestPageTypeFromFinalData === 'product') {
-      let missingForProductMsg = "Bu ÜRÜN sayfası için Cheerio/JSON-LD/Headless ile bulunanları doğrula/geliştir ve ŞU EKSİK BİLGİLERİ metinden çıkar: ";
-      let productMissingFields: string[] = [];
-      if (!finalData.features || finalData.features.length < 1) productMissingFields.push("ürün özellikleri (en az 1-2 adet)");
-      if (!finalData.price) productMissingFields.push("fiyat");
-      if (!finalData.stockStatus) productMissingFields.push("stok durumu");
-      if (!finalData.images || finalData.images.length === 0) productMissingFields.push("en az 1 ana ürün görseli");
-      if (!finalData.category) productMissingFields.push("ürün kategorisi");
-      if (productMissingFields.length > 0) {
-        perform_AI_analysis = true;
-        ai_task_description = missingForProductMsg + productMissingFields.join(', ') + ".";
-      }
-       if (!finalData.currencyCode && finalData.currencySymbol) {
-          perform_AI_analysis = true; 
-          const currencyTask = ` Para birimi sembolü '${finalData.currencySymbol}' için doğru ISO kodunu (TRY, USD, EUR vb.) belirle.`;
-          if (ai_task_description) ai_task_description += currencyTask;
-          else ai_task_description = "Bu ÜRÜN sayfası için" + currencyTask;
-      }
-    } else if (currentBestPageTypeFromFinalData === 'blog') {
-      let missingForBlogMsg = "Bu BLOG yazısı için Cheerio/JSON-LD/Headless ile bulunanları doğrula/geliştir ve ŞU EKSİK BİLGİLERİ metinden çıkar: ";
-      let blogMissingFields: string[] = [];
-      if (!finalData.publishDate) blogMissingFields.push("yayın tarihi");
-      if (!finalData.blogContentSample || finalData.blogContentSample.length < 50) blogMissingFields.push("yazı özeti (en az 50 karakter)");
-      if ((!finalData.blogCategories || finalData.blogCategories.length === 0) && (!finalData.aiBlogTags || finalData.aiBlogTags.length === 0)) blogMissingFields.push("blog kategorileri veya etiketleri");
-      if (blogMissingFields.length > 0) {
-        perform_AI_analysis = true;
-        ai_task_description = missingForBlogMsg + blogMissingFields.join(', ') + ".";
-      }
-    } else if (currentBestPageTypeFromFinalData === 'category') {
-       if (!finalData.metaDescription || finalData.metaDescription.length < 30) {
-            perform_AI_analysis = true;
-            ai_task_description = "Bu KATEGORİ sayfası için kategori adını kesinleştir ve metinden bir kategori açıklaması çıkar.";
-        }
-    }
-
-    if (perform_AI_analysis && (!finalData.mainTextContent || finalData.mainTextContent.length <= 50)) {
-      perform_AI_analysis = false; 
-      addLog(`[API] AI Analysis triggered but overridden due to insufficient content (${finalData.mainTextContent?.length || 0} chars) for ${url}. Using prior data only.`, { level: 'info', context: 'ai-analysis-skip-override', data: { requestId, url }});
-    }
+    const aiBlogCats = finalAiDetectedTypeActual === 'blogPost' ? customAiExtractedData?.blogPostInfo?.categoriesFromPage : null;
+    const jsonLdBlogCatsRaw = jsonLdBlogPostInfo?.articleSection;
+    const jsonLdBlogCats = Array.isArray(jsonLdBlogCatsRaw) ? jsonLdBlogCatsRaw : (jsonLdBlogCatsRaw ? [jsonLdBlogCatsRaw] : []);
     
-    if (perform_AI_analysis && finalData.mainTextContent && finalData.mainTextContent.length > 50) {
-      operationStage = 'ai-call';
-      addLog(`[API] AI Analysis triggered for ${url}: ${ai_task_description}`, {context: 'ai-analysis', data: {requestId}});
-      
-      let cheerioSummary = `CHEERIO/JSON-LD/HEADLESS BULGULARI ÖZETİ (Fetch Yöntemi: ${finalData.fetchMethod}):
-  - Tahmini Sayfa Türü: ${finalData.pageTypeGuess || 'Bilinmiyor'}
-  - Başlık: ${finalData.title || 'Yok'}
-  - Meta Açıklama: ${finalData.metaDescription || 'Yok'}
-  - Fiyat: ${finalData.price ? (finalData.price + (finalData.currencySymbol || '') + (finalData.currencyCode || '')) : 'Yok'}
-  - Stok: ${finalData.stockStatus || 'Yok'}
-  - Kategori (Cheerio): ${finalData.category || 'Yok'}
-  - Yayın Tarihi (Cheerio): ${finalData.publishDate || finalData.date || 'Yok'}
-  - Görsel Sayısı (Cheerio/Headless): ${finalData.images?.length || 0} (OG: ${finalData.ogImage ? 'Var' : 'Yok'})
-  - H1 Başlıkları: ${(finalData.headings?.h1 || []).slice(0,1).join(' | ') || 'Yok'}
-  ${finalData.jsonLdData && finalData.jsonLdData.length > 0 ? `\n- ÖNEMLİ JSON-LD VERİLERİ (ilk şema örneği):\n${JSON.stringify(finalData.jsonLdData[0], null, 1).substring(0, 300)}...\n` : ''}
-  `;
+    finalData.blogCategories = aiBlogCats && aiBlogCats.length > 0 ? aiBlogCats 
+                              : (jsonLdBlogCats.length > 0 ? jsonLdBlogCats
+                              : baseData.blogCategories);
+    finalData.blogPageCategories = finalData.blogCategories;
 
-      const promptContext = `VERİLEN URL: ${url}\n${cheerioSummary}`;
-      const aiPrompt = `
-        ${promptContext}
-        YUKARIDAKİ URL'DEN ÇEKİLEN TEMİZLENMİŞ ANA METİN (en fazla 10000 karakter):
-        ${finalData.mainTextContent?.slice(0,10000) || 'Ana metin bulunamadı veya çok kısa.'}
 
-        GÖREVİN:
-        ${ai_task_description}
-        Aşağıdaki JSON formatını DİKKATLİCE ve EKSİKSİZ doldur. Cheerio/Headless ile bulunan bilgileri KULLAN, DOĞRULA, DÜZELT ve EKSİKLERİ TAMAMLA. Ana metinden çıkarım yapmaya öncelik ver.
-        ÖNEMLİ: "images" alanı için, sayfa türüne uygun (ürün/blog için 1-3 ana görsel, kategori/statik sayfa için 1-2 temsili görsel) en alakalı, yüksek kaliteli görsellerin TAM URL'lerini bul.
-        ÖNEMLİ: "currency" için sadece uluslararası para birimi KODUNU (örn: TRY, USD, EUR) döndür.
-        SADECE ve SADECE aşağıda istenen formatta GEÇERLİ bir JSON nesnesi döndür. Öncesinde veya sonrasında kesinlikle ek metin, yorum veya markdown (\`\`\`json ... \`\`\`) KULLANMA.
-
-        İSTENEN JSON ÇIKTISI:
-        {
-          "detectedPageType": "product | blogPost | categoryPage | staticPage | unknown",
-          "pageTitle": "Sayfanın ana, en doğru ve kullanıcı dostu başlığı",
-          "metaDescription": "Sayfanın SEO uyumlu, kısa ve öz meta açıklaması (maks. 160 karakter)",
-          "productInfo": {
-            "productName": "Ürünün tam ve doğru adı",
-            "price": "123.99" | null,
-            "currency": "TRY" | "USD" | "EUR" | null,
-            "stockStatus": "Mevcut" | "Tükendi" | "Ön Sipariş" | null,
-            "brand": "Marka Adı" | null,
-            "sku": "SKU veya Ürün Kodu" | null,
-            "shortDescription": "Ürünü tanıtan kısa ve çarpıcı bir açıklama (2-3 cümle)" | null,
-            "detailedDescription": "Ürünün ana metinden çıkarılan kapsamlı ve detaylı açıklaması" | null,
-            "images": ["https://example.com/ana-gorsel1.jpg"] | [],
-            "features": ["Özellik Adı 1: Özellik Değeri 1"] | [],
-            "categoriesFromPage": ["Ana Kategori", "Alt Kategori"] | []
-          },
-          "blogPostInfo": {
-            "postTitle": "Blog yazısının tam ve dikkat çekici başlığı",
-            "author": "Yazar Adı" | null,
-            "publishDate": "YYYY-MM-DD" | null,
-            "summary": "Yazının ana fikrini veren kısa ve etkili bir özet" | null,
-            "categoriesFromPage": ["Blog Kategorisi 1"] | [],
-            "tags": ["etiket1", "etiket2"] | [],
-            "images": ["https://example.com/blog-gorsel1.jpg"] | []
-          },
-          "categoryPageInfo": {
-            "categoryName": "Kategori sayfasının net adı",
-            "description": "Kategori hakkında kısa bir açıklama" | null,
-            "images": ["https://example.com/category-banner.jpg"] | []
-          },
-          "staticPageInfo": {
-            "pagePurpose": "Sayfanın temel amacı" | null,
-            "images": ["https://example.com/static-page-image.jpg"] | []
-          }
-        }`;
-
-      const aiResult = await callAI(aiPrompt, preferredAiModel, requestId, url);
-
-      if (aiResult && !aiResult.error && aiResult.detectedPageType && aiResult.detectedPageType !== 'unknown') {
-        finalData.aiDetectedType = aiResult.detectedPageType;
-        finalData.aiExtractedData = aiResult;
-        
-        finalData.title = aiResult.pageTitle || finalData.title;
-        finalData.metaDescription = aiResult.metaDescription || finalData.metaDescription;
-
-        const processAiImageUrls = (urls: string[] | undefined | null, altTextBase: string | undefined | null, pageUrl: string): ImageItem[] => {
-            if (!urls || urls.length === 0) return [];
-            return urls.map((srcStr: unknown) => {
-                if (typeof srcStr === 'string' && srcStr.trim() !== '') {
-                    const resolved = resolveUrlHelper(srcStr, pageUrl);
-                    const altText = altTextBase || finalData.title || 'Image';
-                    return resolved ? { src: resolved, alt: altText, width: undefined, height: undefined, hasAlt: !!altText } : null;
+    // Resim birleştirme
+    const aiImagesRaw = (finalAiDetectedTypeActual === 'product' && customAiExtractedData?.productInfo?.images) ? customAiExtractedData.productInfo.images : 
+                       ((finalAiDetectedTypeActual === 'blogPost' && customAiExtractedData?.blogPostInfo?.images) ? customAiExtractedData.blogPostInfo.images : []);
+    
+    if (Array.isArray(aiImagesRaw) && aiImagesRaw.length > 0) {
+        const existingImageSrcsInFinal = new Set((finalData.images || []).map(img => img.src).filter(Boolean));
+        aiImagesRaw.forEach((imgUrl: unknown) => {
+            if (typeof imgUrl === 'string' && imgUrl.trim() !== '') {
+                const resolvedImgUrl = resolveUrl(imgUrl, url!); 
+                if (resolvedImgUrl && !existingImageSrcsInFinal.has(resolvedImgUrl)) {
+                    (finalData.images = finalData.images || []).push({
+                        src: resolvedImgUrl,
+                        alt: finalData.title || 'AI Extracted Image', hasAlt: !!finalData.title, width: null, height: null
+                    });
+                    existingImageSrcsInFinal.add(resolvedImgUrl);
+                } else if (!resolvedImgUrl && imgUrl.startsWith('http') && !existingImageSrcsInFinal.has(imgUrl)) {
+                    (finalData.images = finalData.images || []).push({
+                        src: imgUrl,
+                        alt: finalData.title || 'AI Extracted Image (unresolved)', hasAlt: !!finalData.title, width: null, height: null
+                    });
+                    existingImageSrcsInFinal.add(imgUrl);
                 }
-                return null;
-            }).filter((img): img is ImageItem => img !== null);
-        };
-        let newAiImages: ImageItem[] = [];
-
-        if (aiResult.productInfo) {
-            finalData.price = aiResult.productInfo.price || finalData.price;
-            finalData.currencyCode = aiResult.productInfo.currency || finalData.currencyCode || mapCurrencySymbolToCode(finalData.currencySymbol);
-            finalData.stockStatus = aiResult.productInfo.stockStatus || finalData.stockStatus;
-            if (aiResult.productInfo.images) newAiImages.push(...processAiImageUrls(aiResult.productInfo.images, aiResult.productInfo.productName || finalData.title, url));
-            finalData.features = aiResult.productInfo.features?.length ? aiResult.productInfo.features : finalData.features;
-            finalData.category = aiResult.productInfo.categoriesFromPage?.join('; ') || finalData.category;
-            finalData.aiProductBrand = aiResult.productInfo.brand || finalData.aiProductBrand;
-            finalData.aiProductSku = aiResult.productInfo.sku || finalData.aiProductSku;
-        }
-        if (aiResult.blogPostInfo) {
-            finalData.publishDate = aiResult.blogPostInfo.publishDate || finalData.publishDate || finalData.date;
-            finalData.blogCategories = aiResult.blogPostInfo.categoriesFromPage?.length ? aiResult.blogPostInfo.categoriesFromPage : finalData.blogCategories;
-            finalData.blogContentSample = aiResult.blogPostInfo.summary || finalData.blogContentSample;
-            if (aiResult.blogPostInfo.images) newAiImages.push(...processAiImageUrls(aiResult.blogPostInfo.images, aiResult.blogPostInfo.postTitle || finalData.title, url));
-            finalData.aiBlogAuthor = aiResult.blogPostInfo.author || finalData.aiBlogAuthor;
-            finalData.aiBlogTags = (aiResult.blogPostInfo.tags?.length ? aiResult.blogPostInfo.tags : undefined) || finalData.aiBlogTags;
-        }
-        if (aiResult.categoryPageInfo) {
-            finalData.category = aiResult.categoryPageInfo.categoryName || finalData.category || finalData.title;
-            if (aiResult.categoryPageInfo.images) newAiImages.push(...processAiImageUrls(aiResult.categoryPageInfo.images, aiResult.categoryPageInfo.categoryName || finalData.title, url));
-        }
-        if (aiResult.staticPageInfo) {
-            if (aiResult.staticPageInfo.images) newAiImages.push(...processAiImageUrls(aiResult.staticPageInfo.images, finalData.title, url));
-        }
-
-        if (newAiImages.length > 0) {
-          const existingImageSrcs = new Set((finalData.images || []).map(img => img.src));
-          const uniqueNewAiImages = newAiImages.filter(img => img.src && !existingImageSrcs.has(img.src));
-          finalData.images = [...(finalData.images || []), ...uniqueNewAiImages];
-        }
-        
-        addLog(`[API] AI successfully enhanced data for ${url}`, { context: 'ai-analysis-success', data: { requestId, type: finalData.aiDetectedType }});
-      } else {
-        finalData.aiDetectedType = finalData.pageTypeGuess || 'ai_error';
-        finalData.aiExtractedData = { detectedPageType: finalData.aiDetectedType || 'unknown', error: aiResult?.error || 'AI analysis failed or type unknown.', ...aiResult };
-        addLog('[API] AI result error or unknown type. Relying on prior data.', { level: 'warn', context: 'ai-analysis-fail', data: { requestId, url, aiError: aiResult?.error, resultPreview: JSON.stringify(aiResult || {}).substring(0,200) }});
-      }
-    } else {
-      finalData.aiDetectedType = finalData.pageTypeGuess;
-      finalData.aiExtractedData = { detectedPageType: finalData.aiDetectedType || 'unknown', pageTitle: finalData.title, metaDescription: finalData.metaDescription };
-      const reason = (!finalData.mainTextContent || finalData.mainTextContent.length <= 50) ? "insufficient content" : "AI analysis not triggered by logic";
-      addLog(`[API] AI analysis SKIPPED for ${url} (${reason}). Using prior data only.`, { level: 'info', context: 'ai-analysis-skip', data: { requestId, url }});
+            }
+        });
     }
+    if (finalData.images && finalData.images.length === 0) finalData.images = null;
 
-    operationStage = 'final-currency-mapping';
+
+    // Para birimi ve hata durumu son kontrolleri
     if (!finalData.currencyCode && finalData.currencySymbol) {
       finalData.currencyCode = mapCurrencySymbolToCode(finalData.currencySymbol);
     }
     if (finalData.currencySymbol && finalData.currencyCode && finalData.currencySymbol.toUpperCase() === finalData.currencyCode.toUpperCase()) {
-      finalData.currencySymbol = null; 
+      finalData.currencySymbol = null;
+    }
+    if (finalData.error && finalData.pageTypeGuess !== 'error') {
+        finalData.pageTypeGuess = 'error';
+    }
+    if (finalData.error && finalData.aiDetectedType !== 'client_error' && finalData.aiDetectedType !== 'ai_error') {
+        finalData.aiDetectedType = 'client_error'; 
+    }
+    if (!finalData.aiDetectedType && !finalData.error) {
+        finalData.aiDetectedType = 'unknown';
     }
 
-    if (fetchMethod.includes('failed') && !finalData.error) {
-        const specificError = headlessErrorDetail || axiosFetchError || 'Content fetch failed';
-        finalData.error = specificError;
-        finalData.message = specificError.substring(0, 150);
-        finalData.pageTypeGuess = 'error';
-        finalData.aiDetectedType = 'client_error';
-    } else if (finalData.error && (finalData.pageTypeGuess !== 'error' || finalData.aiDetectedType !== 'client_error')) {
-        // Eğer bir hata mesajı varsa ama tip error/client_error değilse, bunu zorla.
-        finalData.pageTypeGuess = 'error';
-        finalData.aiDetectedType = 'client_error';
-    }
+
+    // Adım 5: Veritabanına Kaydetme
+    operationStage = 'database-save'; // Set operationStage before calling mapAndSaveScrapedData
+    await mapAndSaveScrapedData(finalData, scrapeId, requestId);
     
-    addLog(`[API] Final data for URL ${url}: Fetch: ${finalData.fetchMethod}, Cheerio/HeadlessType: ${finalData.pageTypeGuess}, AIType: ${finalData.aiDetectedType}, Nav: ${finalData.navigationLinks?.length || 0}, Ftr: ${finalData.footerLinks?.length || 0}`, {context:'process-url-complete', data: {requestId}});
+    addLog(`[API] Successfully processed and saved data for URL ${url}. FinalAIType: ${finalData.aiDetectedType}`, { context: 'process-url-complete', data: { requestId, scrapeId } });
     return NextResponse.json(finalData);
 
-  } catch (error: any) { 
-    logError(error, 'scrape-ai-post-global-error', { context: 'scrape-ai-post-global', data: { requestId, url: requestUrlForError, operationStage, message: error.message, stack: error.stack?.substring(0,500) } });
-    const errorResponse: Partial<ScrapedPageData> = { // Use Partial as not all fields are mandatory for an error response
-        url: requestUrlForError,
-        error: `Global error in POST handler: ${error.message}`,
-        message: `Error at stage ${operationStage}: ${error.message.substring(0,150)}`,
-        pageTypeGuess: 'error',
-        aiDetectedType: 'client_error',
-        title: 'N/A', 
-        metaDescription: 'N/A', 
-        images: [], 
-        // features: [], // Not strictly needed for error response
-        // breadcrumbs: [], 
-        // navigationLinks: [], 
-        // footerLinks: [],
-        fetchMethod: fetchMethod || 'unknown_error_state',
-        fetchTimestamp: new Date().toISOString(),
+  } catch (error: any) {
+    logError(error, 'scrape-ai-post-global-error', { context: 'scrape-ai-post-global', data: { requestId, url: requestUrlForError, scrapeId: scrapeIdFromRequest, operationStage, message: error.message, stack: error.stack?.substring(0,500) }});
+    const errorResponse: ScrapedPageData = {
+      url: requestUrlForError,
+      scrapeId: scrapeIdFromRequest,
+      error: `Global error in POST handler: ${error.message}`,
+      message: `Error at stage ${operationStage}: ${error.message.substring(0,150)}`,
+      pageTypeGuess: 'error',
+      aiDetectedType: 'client_error', 
+      title: 'N/A',
+      metaDescription: null, keywords: null, ogType: null, ogTitle: null, ogDescription: null, ogImage: null, canonicalUrl: null, htmlLang: null, metaRobots: null, jsonLdData: null, schemaOrgTypes: null, price: null, currencySymbol: null, currencyCode: null, stockStatus: null, images: null, category: null, productCategory: null, date: null, publishDate: null, features: null, blogContentSample: null, blogCategories: null, blogPageCategories: null, headings: null, allLinks: null, internalLinks: null, externalLinks: null, navigationLinks: null, footerLinks: null, breadcrumbs: null, mainTextContent: null, siteSelectorsUsed: null, fetchMethod: fetchMethod === 'playwright_pending' ? 'unknown_error' : fetchMethod, rawHtmlLength: null, aiExtractedData: { detectedPageType: 'error', error: `Global error: ${error.message}` }, aiProductBrand: null, aiProductSku: null, aiProductShortDescription: null, aiProductDescription: null, aiBlogAuthor: null, aiBlogTags: null, aiCategoryDescription: null,
     };
-    return NextResponse.json(errorResponse, { status: 500 });
-  } finally { 
-    operationStage = 'global-finally-close-browser';
-    if (playwrightBrowser) {
-      await playwrightBrowser.close();
-      addLog('[API] Playwright browser closed in global finally block.', { context: 'scrape-ai-post', data: { requestId } });
+    // Veritabanında bu URL için hata durumunu güncelle (opsiyonel ama iyi bir pratik)
+    if (scrapeIdFromRequest && requestUrlForError !== 'unknown_url') {
+        try {
+            operationStage = 'database-save-error-state';
+            await mapAndSaveScrapedData(errorResponse, scrapeIdFromRequest, requestId); // Hata durumunu da kaydet
+            addLog(`[API] Error state saved to DB for URL: ${requestUrlForError}`, { context: 'db-save-error', data: { requestId, scrapeId: scrapeIdFromRequest }});
+        } catch (dbError: any) {
+            logError(dbError, 'scrape-ai-db-save-error-state-failed', { context: 'db-save-error-global-handler', data: { requestId, url: requestUrlForError, scrapeId: scrapeIdFromRequest, message: dbError.message }});
+        }
     }
+    return NextResponse.json(errorResponse, { status: 500 });
+  } finally {
+      // Ensure Playwright resources are cleaned up even if they were closed earlier
+      if (pwPage) { try { await pwPage.close(); } catch (e) { addLog(`Error closing Playwright page in finally: ${(e as Error).message}`, {level: 'warn', context: 'playwright-cleanup-finally', data: {requestId}}) } }
+      if (browser) { 
+          try { await browser.close(); 
+              addLog('[API] Playwright browser closed in finally.', { context: 'playwright-cleanup-finally', data: { requestId } }); 
+          } catch (e) { 
+              addLog(`Error closing Playwright browser in finally: ${(e as Error).message}`, { level: 'warn', context: 'playwright-cleanup-finally', data: { requestId } });
+          }
+      }
   }
 });

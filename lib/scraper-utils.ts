@@ -16,7 +16,8 @@ export interface BreadcrumbItem { text: string; href?: string; position: number;
 
 export interface ScrapedPageData {
   url: string;
-  // Cheerio ile çıkarılanlar ve ilk tahminler
+   scrapeId?: string | null; // scrapeId'yi buraya ekleyin
+// Cheerio ile çıkarılanlar ve ilk tahminler
   pageTypeGuess?: 'product' | 'blog' | 'category' | 'page' | 'unknown' | 'collection' | 'forum' | 'search' | 'error' | 'sitemap' | 'robots' | 'feed';
   title?: string | null;
   metaDescription?: string | null;
@@ -106,13 +107,54 @@ export interface ScrapedPageData {
 
 // REMOVED: Local URL_PATTERNS definition (now imported from config)
 // const URL_PATTERNS = { ... }; 
+// BU FONKSİYONU EKLEYİN VE EXPORT EDİN
+export function mapCurrencySymbolToCode(symbol?: string | null): string | null {
+  if (!symbol) return null;
+  const map: Record<string, string> = {
+    '₺': 'TRY',
+    'tl': 'TRY',
+    '$': 'USD',
+    'usd': 'USD',
+    '€': 'EUR',
+    'eur': 'EUR',
+    '£': 'GBP',
+    'gbp': 'GBP',
+    '¥': 'JPY',
+    'cny': 'CNY', // Chinese Yuan için ekleme
+    '₹': 'INR',
+    '₽': 'RUB',
+    '₩': 'KRW',
+    'cad': 'CAD',
+    'aud': 'AUD',
+    // İhtiyaç duyulabilecek diğer yaygın semboller ve kısaltmalar eklenebilir
+  };
+  const trimmedSymbol = symbol.trim().toLowerCase();
+
+  // Önce tam eşleşmeleri kontrol et (örn: "usd")
+  if (map[trimmedSymbol]) {
+    return map[trimmedSymbol];
+  }
+
+  // Sonra sembolün içinde geçip geçmediğini kontrol et (örn: "100₺" için "₺")
+  for (const key in map) {
+    if (trimmedSymbol.includes(key.toLowerCase())) {
+      return map[key];
+    }
+  }
+
+  // Eğer direkt eşleşme yoksa ve 3 harfli bir kodsa onu döndür
+  if (trimmedSymbol.length === 3 && /^[a-z]+$/.test(trimmedSymbol)) {
+    return trimmedSymbol.toUpperCase();
+  }
+  return null;
+}
 
 function sanitizeText(text: string | undefined | null): string | null {
   if (typeof text !== 'string') return null;
   return text.replace(/\s\s+/g, ' ').replace(/\u00A0/g, ' ').trim() || null; // Replaces non-breaking spaces too
 }
 
-function resolveUrl(relativeUrl: string | undefined | null, baseUrl: string): string | null {
+export function resolveUrl(relativeUrl: string | undefined | null, baseUrl: string): string | null {
   if (!relativeUrl) return null;
   try {
     // If relativeUrl is already absolute, NodeURL constructor will handle it.
@@ -670,6 +712,9 @@ export async function extractBaseDataFromHtml(
     pageUrl: string
 ): Promise<Partial<ScrapedPageData>> {
   const $ = cheerio.load(htmlContent);
+  let siteHostname = '';
+  try { siteHostname = new NodeURL(pageUrl).hostname; } catch (e) { console.warn(`Invalid pageUrl for hostname extraction: ${pageUrl}`, e); }
+
   const data: Partial<ScrapedPageData> = {
     url: pageUrl,
     images: [],
@@ -685,244 +730,195 @@ export async function extractBaseDataFromHtml(
     footerLinks: [], // Initialized
     breadcrumbs: [], // Initialized
   };
-  let siteHostname = '';
-  try { siteHostname = new NodeURL(pageUrl).hostname; }
-  catch (e) { console.warn(`Invalid pageUrl for hostname extraction: ${pageUrl}`, e); }
 
   const siteSelectors = siteHostname ? await getStoredSiteSelectors(siteHostname) : null;
-  if (siteSelectors) {
-      addLog(`[ScraperUtils] Using specific selectors for ${siteHostname}`, {pageUrl});
-      data.siteSelectorsUsed = true;
-  } else {
-      addLog(`[ScraperUtils] No specific selectors for ${siteHostname}. Using GENERAL_SELECTORS.`, {pageUrl});
-      data.siteSelectorsUsed = false;
-  }
+  data.siteSelectorsUsed = !!siteSelectors;
 
-  // 1. Temel Metadatalar
-  data.title = getElementText($, siteSelectors?.title, GENERAL_SELECTORS.title) || sanitizeText($('h1').first().text()) || pageUrl.split('/').pop()?.replace(/-/g, ' ')?.replace(/_/g, ' ') || 'Başlık Yok';
-  try {
-    const currentUrlObj = new NodeURL(pageUrl);
-    if (data.title === pageUrl || data.title?.toLowerCase().includes(currentUrlObj.hostname.toLowerCase())) {
-        data.title = sanitizeText($('h1').first().text()) || sanitizeText($('title').text()) || 'Başlık Yok';
-    }
-  } catch(e) { /* no-op if pageUrl is invalid */ }
-  
-  data.metaDescription = getElementText($, siteSelectors?.metaDescription, GENERAL_SELECTORS.metaDescription); 
-  const keywordsString = getElementText($, siteSelectors?.keywords, GENERAL_SELECTORS.keywords);
-  data.keywords = keywordsString ? keywordsString.split(',').map(k => sanitizeText(k)).filter((k): k is string => k !== null && k.length > 1) : undefined;
-  if (data.keywords?.length === 0) data.keywords = undefined;
+  // --- 1. Temel Metadatalar (ÖNCELİKLE BUNLAR OKUNMALI) ---
+  data.title = sanitizeText($('title').text()) || 
+               sanitizeText($('meta[property="og:title"]').attr('content')) || 
+               sanitizeText($('h1').first().text()) || 
+               pageUrl.split('/').pop()?.replace(/-/g, ' ')?.replace(/_/g, ' ') || 
+               'Başlık Yok';
+
+  // AÇIKLAMA (META DESCRIPTION) ÇIKARMA
+  const metaDescTag = $('meta[name="description"]').attr('content');
+  const ogDescTag = $('meta[property="og:description"]').attr('content');
+  data.metaDescription = sanitizeText(metaDescTag || ogDescTag); // Öncelik meta desc, sonra og:desc
 
   data.ogType = sanitizeText($('meta[property="og:type"]').attr('content'));
+  // og:title ve og:description'ı, data.title ve data.metaDescription'dan sonra,
+  // eğer spesifik olarak ayarlanmışlarsa kullanmak daha iyi olabilir.
   data.ogTitle = sanitizeText($('meta[property="og:title"]').attr('content')) || data.title;
   data.ogDescription = sanitizeText($('meta[property="og:description"]').attr('content')) || data.metaDescription;
+  
   data.ogImage = resolveUrl(getElementText($, siteSelectors?.ogImage, GENERAL_SELECTORS.ogImage, 'content'), pageUrl);
   data.canonicalUrl = resolveUrl(getElementText($, siteSelectors?.canonicalUrl, GENERAL_SELECTORS.canonicalUrl, 'href'), pageUrl);
   data.htmlLang = sanitizeText($('html').attr('lang'));
   data.metaRobots = getElementText($, [{selector: 'meta[name="robots"]', attr: 'content'}]);
+  data.keywords = (getElementText($, siteSelectors?.keywords, GENERAL_SELECTORS.keywords) || "").split(',').map(k => sanitizeText(k)).filter((k): k is string => k !== null && k.length > 1);
+  if (data.keywords?.length === 0) data.keywords = undefined;
 
-  // 2. JSON-LD
+
+  // --- 2. JSON-LD Verilerini Çekme ve Temel Alanları Doldurma ---
   const schemaOrgTypesFromLd: string[] = [];
-  let mainProductSchema: any = null, mainBlogSchema: any = null, mainCategorySchema: any = null;
-  
+  let mainProductSchema: any = null;
+  let mainBlogSchema: any = null;
+  let mainCategorySchema: any = null; // CollectionPage veya SearchResultsPage için
   const tempJsonLdData: any[] = [];
+
   $('script[type="application/ld+json"]').each((i, el) => {
     try {
       const scriptContent = $(el).html();
       if (scriptContent) {
-        const parsedJson = JSON.parse(scriptContent);
-        const itemsToPush = Array.isArray(parsedJson) ? parsedJson : [parsedJson];
-        itemsToPush.forEach(item => {
-          if (typeof item === 'object' && item !== null) {
-            tempJsonLdData.push(item);
-            const type = item['@type'];
-            const currentTypes = Array.isArray(type) ? type.map(t => String(t).toLowerCase()) : (type ? [String(type).toLowerCase()] : []);
-            if (currentTypes.some(t => t === 'product')) { if (!mainProductSchema) mainProductSchema = item; }
-            if (currentTypes.some(t => t === 'blogposting' || t === 'article' || t === 'newsarticle')) { if (!mainBlogSchema) mainBlogSchema = item; }
-            if (currentTypes.some(t => t === 'collectionpage' || t === 'itemlist' || t === 'productgroup' || t === 'categorycodelist')) { if (!mainCategorySchema) mainCategorySchema = item; }
-            currentTypes.forEach(t => schemaOrgTypesFromLd.push(t));
+        const jsonData = JSON.parse(scriptContent);
+        const itemsToProcess = Array.isArray(jsonData) ? jsonData : [jsonData];
+        
+        for (const item of itemsToProcess) {
+          if (typeof item !== 'object' || item === null) continue;
+          tempJsonLdData.push(item);
+          const type = item['@type'];
+          if (type) {
+            const typesArray = Array.isArray(type) ? type.map(t => String(t).toLowerCase()) : [String(type).toLowerCase()];
+            typesArray.forEach((t: string) => schemaOrgTypesFromLd.push(t));
+
+            if (typesArray.includes('product') && !mainProductSchema) mainProductSchema = item;
+            if ((typesArray.includes('blogposting') || typesArray.includes('article') || typesArray.includes('newsarticle')) && !mainBlogSchema) mainBlogSchema = item;
+            if ((typesArray.includes('collectionpage') || typesArray.includes('itemlist') || typesArray.includes('searchresultspage')) && !mainCategorySchema) mainCategorySchema = item;
           }
-        });
+        }
       }
-    } catch (e) { console.warn(`Error parsing JSON-LD from ${pageUrl}: ${e instanceof Error ? e.message : String(e)}`); }
+    } catch (e) { addLog(`[ScraperUtils] Error parsing JSON-LD: ${(e as Error).message}`, { level: 'warn' }); }
   });
   data.jsonLdData = tempJsonLdData.length > 0 ? tempJsonLdData : null;
   data.schemaOrgTypes = schemaOrgTypesFromLd.length > 0 ? [...new Set(schemaOrgTypesFromLd)] : undefined;
 
-  // 3. SAYFA TÜRÜ TAHMİNİ
-  let pageTypeGuess: ScrapedPageData['pageTypeGuess'] = 'unknown';
-  if (mainProductSchema) pageTypeGuess = 'product';
-  else if (mainBlogSchema) pageTypeGuess = 'blog'; 
-  else if (mainCategorySchema) pageTypeGuess = 'category'; 
-
-  if (pageTypeGuess === 'unknown' && data.ogType) {
-    const ogTypeLower = data.ogType.toLowerCase();
-    if (ogTypeLower.includes('product')) pageTypeGuess = 'product';
-    else if (ogTypeLower.includes('article') || ogTypeLower.includes('blog') || ogTypeLower.includes('news')) pageTypeGuess = 'blog'; 
-  }
-  
-  // HTML içeriğinden tahmin
-  if (pageTypeGuess === 'unknown') {
-      const priceSelectorsToJoin = (siteSelectors?.price || []).concat(GENERAL_SELECTORS.price || []);
-      const priceSelStr = priceSelectorsToJoin.map(s => s.selector).join(', ');
-      const hasPrice = priceSelStr ? $(priceSelStr).length > 0 : false;
-      const hasAddToCart = $('form[action*="cart"] button, button[name*="add-to-cart"], .add-to-cart-button, input[name*="add-to-cart"]').length > 0;
-      
-      // Assuming GENERAL_SELECTORS.stockStatus exists in config as per prompt
-      const stockSelectorsToJoin = (siteSelectors?.stockStatus || []).concat(GENERAL_SELECTORS.stockStatus || []); 
-      const stockSelStr = stockSelectorsToJoin.map(s => s.selector).join(', ');
-      const hasStockInfo = stockSelStr ? $(stockSelStr).length > 0 : false;
-
-      if (hasPrice && (hasAddToCart || hasStockInfo)) {
-          pageTypeGuess = 'product';
-      }
-      else if ($('.product-item, .product-list-item, .prd-list-item, [class*="product_item"]').length > 2 || 
-               $('.category-products, .product-grid, .product_list').length > 0) {
-          pageTypeGuess = 'category'; 
-      }
-      else if ($('article.post, .blog-post, .entry-content, [itemtype*="BlogPosting"]').length > 0 || 
-               $('#comments, .comment-list, .post-comments').length > 0) {
-          pageTypeGuess = 'blog'; 
-      }
-  }
-  
-  // URL deseninden tahmin (config'den gelen GENERAL_URL_PATTERNS kullanılacak)
-  if (pageTypeGuess === 'unknown') {
-    try {
-        const path = new NodeURL(pageUrl).pathname.toLowerCase();
-        const query = new NodeURL(pageUrl).search.toLowerCase();
-
-        if (GENERAL_URL_PATTERNS.product.some(p => path.includes(p))) pageTypeGuess = 'product';
-        else if (GENERAL_URL_PATTERNS.blog.some(p => path.includes(p))) pageTypeGuess = 'blog'; 
-        else if (GENERAL_URL_PATTERNS.category.some(p => path.includes(p))) pageTypeGuess = 'category'; 
-        else if (GENERAL_URL_PATTERNS.collection && GENERAL_URL_PATTERNS.collection.some(p => path.includes(p))) pageTypeGuess = 'collection';
-        else if (GENERAL_URL_PATTERNS.forum && GENERAL_URL_PATTERNS.forum.some(p => path.includes(p))) pageTypeGuess = 'forum';
-        else if (GENERAL_URL_PATTERNS.search && (GENERAL_URL_PATTERNS.search.some(p => path.includes(p)) || query.includes('q=') || query.includes('query=') || query.includes('search='))) pageTypeGuess = 'search';
-        else if (GENERAL_URL_PATTERNS.error && GENERAL_URL_PATTERNS.error.some(p => path.includes(p))) pageTypeGuess = 'error';
-        else if (path === '/sitemap.xml' || path.endsWith('/sitemap.xml') || path.includes('sitemap_index.xml')) pageTypeGuess = 'sitemap';
-        else if (path === '/robots.txt') pageTypeGuess = 'robots';
-        else if (path === '/feed' || path === '/rss' || (path.endsWith('.xml') && (htmlContent.includes('<rss') || htmlContent.includes('<feed')))) pageTypeGuess = 'feed';
-        else if (path === '/' || (GENERAL_URL_PATTERNS.staticPageKeywords && GENERAL_URL_PATTERNS.staticPageKeywords.some(k => path.includes(k)))) pageTypeGuess = 'page';
-    } catch (e) { /* invalid URL, pageTypeGuess remains unknown */ }
-  }
-  data.pageTypeGuess = pageTypeGuess;
-
-  // 4. JSON-LD'DEN DETAYLI VERİ ÇIKARMA
-  const jsonLdImages: ImageItem[] = [];
+  // JSON-LD'den temel alanları önceden doldur (LLM için iyi bir başlangıç)
   if (mainProductSchema) {
     data.title = sanitizeText(mainProductSchema.name) || data.title;
     data.metaDescription = sanitizeText(mainProductSchema.description) || data.metaDescription;
     if (mainProductSchema.image) {
-        const images = (Array.isArray(mainProductSchema.image) ? mainProductSchema.image : [mainProductSchema.image]);
-        images.forEach((imgObj: any) => {
-          let imgUrl = null;
-          if (typeof imgObj === 'string') imgUrl = imgObj;
-          else if (imgObj && typeof imgObj === 'object') imgUrl = imgObj.url || imgObj.contentUrl;
-          const absSrc = resolveUrl(imgUrl, pageUrl);
-          if (absSrc) {
-              jsonLdImages.push({ 
-                  src: absSrc, 
-                  alt: sanitizeText(mainProductSchema.name || imgObj?.caption || imgObj?.name) || 'Product Image', 
-                  hasAlt: !!(mainProductSchema.name || imgObj?.caption || imgObj?.name),
-                  width: sanitizeText(imgObj?.width?.toString()),
-                  height: sanitizeText(imgObj?.height?.toString()),
-              });
-          }
+        const pImages = Array.isArray(mainProductSchema.image) ? mainProductSchema.image : [mainProductSchema.image];
+        pImages.forEach((img: string | { url?: string; contentUrl?: string; thumbnailUrl?: string }) => {
+            let pImgSrc: string | undefined | null = typeof img === 'string' ? img : (img?.url || img?.contentUrl || img?.thumbnailUrl);
+            const resolvedImg = resolveUrl(pImgSrc, pageUrl);
+            if (resolvedImg && !(data.images || []).some(i => i.src === resolvedImg)) {
+                (data.images = data.images || []).push({ src: resolvedImg, alt: data.title || 'Product Image', hasAlt: !!data.title, width: null, height: null });
+            }
         });
     }
     if (mainProductSchema.offers) {
-      const offer = Array.isArray(mainProductSchema.offers) ? (mainProductSchema.offers[0] || mainProductSchema.offers) : mainProductSchema.offers;
-      if (offer && typeof offer === 'object') {
-        data.price = sanitizeText(offer.price?.toString() || offer.lowPrice?.toString() || offer.highPrice?.toString())?.replace(',', '.');
-        data.currencySymbol = sanitizeText(offer.priceCurrency); 
-        const availability = sanitizeText(offer.availability)?.toLowerCase();
-        if (availability) {
-          if (availability.includes('instock') || availability.includes('onbackorder') || 
-              availability.includes('preorder') || availability.includes('limitedavailability')) {
-            data.stockStatus = 'Mevcut';
-          } else if (availability.includes('outofstock') || availability.includes('soldout') || 
-                    availability.includes('discontinued')) {
-            data.stockStatus = 'Tükendi';
-          } else {
-            data.stockStatus = sanitizeText(offer.availability);
-          }
+        const offer = Array.isArray(mainProductSchema.offers) ? mainProductSchema.offers[0] : mainProductSchema.offers;
+        if (offer) {
+            data.price = sanitizeText(offer.price?.toString() || offer.lowPrice?.toString()) || data.price;
+            data.currencyCode = sanitizeText(offer.priceCurrency) || data.currencyCode; // Genellikle kod olur
+            if (offer.availability) {
+                const availability = sanitizeText(offer.availability.toLowerCase())?.replace('http://schema.org/', '');
+                if (availability?.includes('instock')) data.stockStatus = 'Mevcut';
+                else if (availability?.includes('outofstock')) data.stockStatus = 'Tükendi';
+                else if (availability?.includes('preorder')) data.stockStatus = 'Ön Sipariş';
+                else data.stockStatus = sanitizeText(offer.availability) || data.stockStatus;
+            }
         }
-      }
     }
-    data.category = sanitizeText(mainProductSchema.category || mainProductSchema.brand?.name); 
-    if (mainProductSchema.additionalProperty && Array.isArray(mainProductSchema.additionalProperty)) {
-      data.features = mainProductSchema.additionalProperty
-        .filter((prop: any) => typeof prop === 'object' && prop.name && prop.value)
-        .map((prop: any) => `${sanitizeText(prop.name)}: ${sanitizeText(prop.value)}`)
-        .filter((f): f is string => f.length > 3);
-        if (data.features?.length === 0) data.features = undefined;
+    data.aiProductBrand = sanitizeText(mainProductSchema.brand?.name) || data.aiProductBrand;
+    data.aiProductSku = sanitizeText(mainProductSchema.sku || mainProductSchema.mpn) || data.aiProductSku;
+    if (mainProductSchema.category) {
+        const catString = Array.isArray(mainProductSchema.category) ? mainProductSchema.category.join('; ') : mainProductSchema.category;
+        data.category = sanitizeText(catString) || data.category; // Genel kategori için
+        (data as any).productCategory = sanitizeText(catString) || (data as any).productCategory; // Ürün kategorisi için
     }
-    data.aiProductSku = sanitizeText(mainProductSchema.sku || mainProductSchema.mpn || mainProductSchema.gtin13 || mainProductSchema.gtin14 || mainProductSchema.gtin8 || mainProductSchema.productID);
-    data.aiProductBrand = sanitizeText(mainProductSchema.brand?.name);
+     if (mainProductSchema.additionalProperty) {
+        const pFeatures: string[] = [];
+        const addProps = Array.isArray(mainProductSchema.additionalProperty) ? mainProductSchema.additionalProperty : [mainProductSchema.additionalProperty];
+        addProps.forEach((prop: { name?: string; value?: string; propertyID?: string }) => {
+            if (prop.name && prop.value) pFeatures.push(`${sanitizeText(prop.name)}: ${sanitizeText(prop.value)}`);
+            else if (prop.value && prop.propertyID) pFeatures.push(`${sanitizeText(prop.propertyID)}: ${sanitizeText(prop.value)}`);
+            else if (prop.value) pFeatures.push(sanitizeText(prop.value)!);
+        });
+        if (pFeatures.length > 0) data.features = [...new Set([...(data.features || []), ...pFeatures.filter(f => f)])];
+    }
   }
-  else if (mainBlogSchema) {
+  if (mainBlogSchema) {
     data.title = sanitizeText(mainBlogSchema.headline || mainBlogSchema.name) || data.title;
-    data.metaDescription = sanitizeText(mainBlogSchema.description || mainBlogSchema.articleBody?.substring(0,300)) || data.metaDescription;
-    data.publishDate = sanitizeText(mainBlogSchema.datePublished || mainBlogSchema.dateCreated); 
-    if (data.publishDate && data.publishDate.includes('T')) data.publishDate = data.publishDate.split('T')[0];
-    
+    data.metaDescription = sanitizeText(mainBlogSchema.description || mainBlogSchema.articleBody?.substring(0,160)) || data.metaDescription;
+    data.publishDate = sanitizeText(mainBlogSchema.datePublished || mainBlogSchema.dateCreated)?.split('T')[0] || data.publishDate;
+    data.aiBlogAuthor = sanitizeText(mainBlogSchema.author?.name || (Array.isArray(mainBlogSchema.author) ? mainBlogSchema.author[0]?.name : null)) || data.aiBlogAuthor;
     if (mainBlogSchema.articleSection) {
-      data.blogCategories = (Array.isArray(mainBlogSchema.articleSection) ? 
-                            mainBlogSchema.articleSection : [mainBlogSchema.articleSection])
-                            .map(s => typeof s === 'string' ? sanitizeText(s) : (s?.name ? sanitizeText(s.name) : null))
-                            .filter((s): s is string => s !== null && s.length > 1);
-      if (data.blogCategories?.length === 0) data.blogCategories = undefined;
+        const bCats = (Array.isArray(mainBlogSchema.articleSection) ? mainBlogSchema.articleSection : [mainBlogSchema.articleSection])
+                      .map(s => typeof s === 'string' ? sanitizeText(s) : (s?.name ? sanitizeText(s.name) : null))
+                      .filter((s): s is string => s !== null && s.length > 1);
+        if (bCats.length > 0) data.blogCategories = [...new Set([...(data.blogCategories || []), ...bCats])];
     }
-    data.aiBlogAuthor = sanitizeText(mainBlogSchema.author?.name || (Array.isArray(mainBlogSchema.author) && mainBlogSchema.author[0]?.name));
-    data.blogContentSample = sanitizeText(mainBlogSchema.articleBody?.substring(0, 500) || $('article p').first().text());
+    // Blog görselleri de eklenebilir
+  }
 
-    if (mainBlogSchema.image) {
-      const images = (Array.isArray(mainBlogSchema.image) ? mainBlogSchema.image : [mainBlogSchema.image]);
-      images.forEach((imgObj: any) => {
-        let imgUrl = null;
-        if (typeof imgObj === 'string') imgUrl = imgObj;
-        else if (imgObj && typeof imgObj === 'object') imgUrl = imgObj.url || imgObj.contentUrl;
-        const absSrc = resolveUrl(imgUrl, pageUrl);
-        if (absSrc) {
-            jsonLdImages.push({ 
-                src: absSrc, 
-                alt: sanitizeText(mainBlogSchema.headline || imgObj?.caption || imgObj?.name) || 'Blog Image', 
-                hasAlt: !!(mainBlogSchema.headline || imgObj?.caption || imgObj?.name),
-                width: sanitizeText(imgObj?.width?.toString()),
-                height: sanitizeText(imgObj?.height?.toString()),
-            });
-        }
-      });
+  // --- 3. Sayfa Türü Tahmini (JSON-LD, URL ve HTML ipuçlarıyla) ---
+  let pageTypeGuess: ScrapedPageData['pageTypeGuess'] = 'unknown';
+  // Öncelik JSON-LD tiplerine
+  if (data.schemaOrgTypes?.some(t => t === 'product')) pageTypeGuess = 'product';
+  else if (data.schemaOrgTypes?.some(t => t === 'blogposting' || t === 'article' || t === 'newsarticle')) pageTypeGuess = 'blog'; // Daha spesifik
+  else if (data.schemaOrgTypes?.some(t => t === 'collectionpage' || t === 'itemlist' || t === 'searchresultspage')) pageTypeGuess = 'category';
+  else if (data.schemaOrgTypes?.some(t => t === 'webpage' || t === 'aboutpage' || t === 'contactpage')) pageTypeGuess = 'page';
+
+  // Sonra OG:Type
+  if (pageTypeGuess === 'unknown' && data.ogType) {
+    const ogTypeLower = data.ogType.toLowerCase();
+    if (ogTypeLower.includes('product')) pageTypeGuess = 'product';
+    else if (ogTypeLower.includes('article')) pageTypeGuess = 'blog';
+  }
+
+  // Sonra URL Yolu
+  if (pageTypeGuess === 'unknown') {
+    try {
+        const parsedPageUrl = new NodeURL(pageUrl);
+        const path = parsedPageUrl.pathname.toLowerCase();
+        if (path === '/' && !parsedPageUrl.search && !parsedPageUrl.hash) {
+            pageTypeGuess = 'page'; // Özel tip homepage yerine page
+        } else if (GENERAL_URL_PATTERNS.staticPageKeywords?.some(k => path.includes(k))) {
+            pageTypeGuess = 'page';
+        } else if (GENERAL_URL_PATTERNS.product?.some(p => (typeof p === 'string' ? path.includes(p) : p.test(path)))) pageTypeGuess = 'product';
+        else if (GENERAL_URL_PATTERNS.blog?.some(p => (typeof p === 'string' ? path.includes(p) : p.test(path)))) pageTypeGuess = 'blog';
+        else if (GENERAL_URL_PATTERNS.category?.some(p => (typeof p === 'string' ? path.includes(p) : p.test(path)))) pageTypeGuess = 'category';
+        // ... diğer URL desenleri
+    } catch(e) { /* no-op */ }
+  }
+  
+  // Son olarak HTML içeriğinden ipuçları (eğer hala unknown ise)
+  if (pageTypeGuess === 'unknown') {
+    if (getElementText($, siteSelectors?.price, GENERAL_SELECTORS.price) || $('[itemprop="price"]').length > 0 || $('[class*="price"]').length > 0) {
+        pageTypeGuess = 'product';
+    } else if ($('article.post, .blog-post, .entry-content, [class*="blog-content"]').length > 0) {
+        pageTypeGuess = 'blog';
+    } else if ($('.products, .product-list, .category-products, [class*="product-grid"]').length > 0) {
+        pageTypeGuess = 'category';
     }
   }
-  else if (mainCategorySchema) {
-    data.title = sanitizeText(mainCategorySchema.name || mainCategorySchema.headline) || data.title;
-    data.category = data.title; 
-    data.metaDescription = sanitizeText(mainCategorySchema.description) || data.metaDescription;
-  }
-  data.images = [...(data.images || []), ...jsonLdImages];
+  data.pageTypeGuess = pageTypeGuess;
 
-
-  // 5. CHEERIO SEÇICİLERİ İLE EKSİKLERİ TAMAMLAMA
+  // --- 4. Cheerio Seçicileri ile Eksik Kalan Temel Alanları Doldurma ---
+  // (Bu kısım, JSON-LD'den sonra çalışarak eksikleri tamamlar veya üzerine yazar - önceliklendirme önemli)
+  if (!data.title || data.title === 'Başlık Yok') data.title = getElementText($, siteSelectors?.title, GENERAL_SELECTORS.title) || data.title;
+  if (!data.metaDescription) data.metaDescription = getElementText($, siteSelectors?.metaDescription, GENERAL_SELECTORS.metaDescription) || data.metaDescription;
+  
   if (pageTypeGuess === 'product') {
     if (!data.price) {
         data.price = getElementText($, siteSelectors?.price, GENERAL_SELECTORS.price);
-        if (data.price && !data.currencySymbol) {
-          const priceMatch = data.price.match(/([^\d,.\s](?:\s*\d|\d))?([\d,.\s]+)([^\d,.\s](?:\s*\d|\d))?/);
-          if (priceMatch) {
+    }
+    if (data.price && !data.currencySymbol && !data.currencyCode) { 
+        const priceMatch = data.price.match(/([^\d,.\s](?:\s*\d|\d))?([\d,.\s]+)([^\d,.\s](?:\s*\d|\d))?/);
+        if (priceMatch) {
             data.price = sanitizeText(priceMatch[2])?.replace(/\.(?=\d{3}(?:,|$))/g, '').replace(',', '.');
             const symbol1 = sanitizeText(priceMatch[1]);
             const symbol3 = sanitizeText(priceMatch[3]);
-            if (symbol1 && /[$€₺£¥]/.test(symbol1)) data.currencySymbol = symbol1;
-            else if (symbol3 && /[$€₺£¥]/.test(symbol3)) data.currencySymbol = symbol3;
-            else data.currencySymbol = symbol1 || symbol3;
-          } else {
-             data.price = data.price.replace(/[^\d,.]/g, '').replace(/\.(?=\d{3}(?:,|$))/g, '').replace(',', '.');
-          }
+            data.currencySymbol = symbol1 || symbol3; // Take first available
+            if (data.currencySymbol) data.currencyCode = mapCurrencySymbolToCode(data.currencySymbol);
+        } else {
+            data.price = data.price.replace(/[^\d,.]/g, '').replace(/\.(?=\d{3}(?:,|$))/g, '').replace(',', '.');
         }
     }
-    if (!data.stockStatus) {
-        // MODIFIED: Use GENERAL_SELECTORS.stockStatus and default to "Bilinmiyor"
-        data.stockStatus = getElementText($, siteSelectors?.stockStatus, GENERAL_SELECTORS.stockStatus); 
+    if (!data.stockStatus || data.stockStatus === "Bilinmiyor") {
+        data.stockStatus = getElementText($, siteSelectors?.stockStatus, GENERAL_SELECTORS.stockStatus) || data.stockStatus;
         if (data.stockStatus) {
             const stockLower = data.stockStatus.toLowerCase();
             if (stockLower.includes('out of stock') || stockLower.includes('tükendi') || stockLower.includes('yok') || stockLower.includes('stokta yok')) {
@@ -934,76 +930,79 @@ export async function extractBaseDataFromHtml(
             data.stockStatus = "Bilinmiyor"; // Default if not found
         }
     }
-    // MODIFIED: Condition for features
-    if ((!data.features || data.features.length === 0)) { 
-        data.features = getAllElementTexts($, (siteSelectors?.features || []).concat(GENERAL_SELECTORS.features || []));
-    }
     if (!data.category) data.category = getElementText($, siteSelectors?.productCategory, GENERAL_SELECTORS.productCategory);
-  }
-  else if (pageTypeGuess === 'blog') {
-    if (!data.publishDate) data.publishDate = getElementText($, siteSelectors?.publishDate, GENERAL_SELECTORS.publishDate);
-    if (data.publishDate && data.publishDate.includes('T')) data.publishDate = data.publishDate.split('T')[0];
-    if (!data.blogCategories?.length) data.blogCategories = getAllElementTexts($, (siteSelectors?.blogPageCategories || []).concat(GENERAL_SELECTORS.blogCategories || []));
-    if (data.blogCategories) data.blogCategories = [...new Set(data.blogCategories.filter(c => c.length > 1))];
-    if (!data.blogContentSample) data.blogContentSample = getElementText($, siteSelectors?.blogContentSample, GENERAL_SELECTORS.blogContentSample);
-    if (data.blogContentSample) data.blogContentSample = data.blogContentSample.slice(0,300) + (data.blogContentSample.length > 300 ? '...' : '');
-  }
-  else if (pageTypeGuess === 'category' && !data.category) {
-      data.category = data.title || getElementText($, siteSelectors?.categoryName, GENERAL_SELECTORS.title); 
+    if (!data.features || data.features.length === 0) data.features = getAllElementTexts($, (siteSelectors?.features || []).concat(GENERAL_SELECTORS.features || []));
+  } else if (pageTypeGuess === 'blog') {
+    if (!data.publishDate) data.publishDate = getElementText($, siteSelectors?.publishDate, GENERAL_SELECTORS.publishDate)?.split('T')[0];
+    if (!data.blogCategories || data.blogCategories.length === 0) {
+        data.blogCategories = getAllElementTexts($, (siteSelectors?.blogPageCategories || []).concat(GENERAL_SELECTORS.blogCategories || []));
+        if (data.blogCategories) data.blogCategories = [...new Set(data.blogCategories.filter(c => c.length > 1))];
+    }
+    if (!data.blogContentSample) data.blogContentSample = getElementText($, siteSelectors?.blogContentSample, GENERAL_SELECTORS.blogContentSample)?.slice(0,500);
   }
 
-  // 6. GENEL YAPISAL ELEMANLAR
-  const productImagesSelectors = (siteSelectors?.productImages || []).concat(GENERAL_SELECTORS.productImages || []);
-  const allExtractedImages = extractImagesFromSelectors($, pageUrl, productImagesSelectors, 'article img, main img, .content img');
-  data.images = [...(data.images || []), ...allExtractedImages];
-  
-  if (data.ogImage && !(data.images || []).some(img => img.src === data.ogImage)) {
-    (data.images || []).push({ src: data.ogImage, alt: 'OG Image', hasAlt: true, width: null, height: null });
-  }
 
-  const uniqueImageMap = new Map<string, ImageItem>();
-  (data.images || []).forEach(img => { if(img?.src && !uniqueImageMap.has(img.src)) uniqueImageMap.set(img.src, img); }); 
-  data.images = Array.from(uniqueImageMap.values());
-  if (data.images.length === 0) data.images = null;
-  
-  if (!data.ogImage && data.images && data.images.length > 0) {
-      const firstGoodImage = data.images.find(img => img.src && !/logo|icon|avatar|banner|placeholder|favicon|svg/i.test(img.src) && (img.width ? parseInt(img.width) > 100 : true) && (img.height ? parseInt(img.height) > 100 : true));
-      if (firstGoodImage) data.ogImage = firstGoodImage.src;
-      else if (data.images[0]?.src) data.ogImage = data.images[0].src;
-  }
-
+  // --- 5. Diğer Yapısal Elemanlar (Breadcrumbs, Linkler, Görseller) ---
   data.headings = extractHeadingsCheerio($);
   data.breadcrumbs = extractBreadcrumbsCheerio($, pageUrl);
-  // Breadcrumb'dan kategori çıkarımı (existing logic)
+  // Breadcrumb'dan Kategori Çıkarımı (Eğer hala eksikse)
   if (data.breadcrumbs && data.breadcrumbs.length > 0) {
-    if (pageTypeGuess === 'product' && !data.category && data.breadcrumbs.length > 1) {
-        data.category = data.breadcrumbs[data.breadcrumbs.length - 2]?.text;
-    } else if (pageTypeGuess === 'blog' && (!data.blogCategories || data.blogCategories?.length === 0) && data.breadcrumbs.length > 1) {
-        const categoryFromBreadcrumb = data.breadcrumbs[data.breadcrumbs.length - 2]?.text;
-        if (categoryFromBreadcrumb) data.blogCategories = [categoryFromBreadcrumb];
+    if (pageTypeGuess === 'product' && !data.category) {
+        if (data.breadcrumbs.length > 1) data.category = data.breadcrumbs[data.breadcrumbs.length - 2]?.text;
+        else if (data.breadcrumbs[0]?.text.toLowerCase() !== 'anasayfa' && data.breadcrumbs[0]?.text.toLowerCase() !== 'home') data.category = data.breadcrumbs[0]?.text;
+        if (data.category) (data as any).productCategory = data.breadcrumbs.map(b => b.text).join(' > '); 
     } else if (pageTypeGuess === 'category' && !data.category) {
         data.category = data.breadcrumbs[data.breadcrumbs.length - 1]?.text;
+    } else if (pageTypeGuess === 'blog' && (!data.blogCategories || data.blogCategories.length === 0)) {
+        if (data.breadcrumbs.length > 1) {
+            const bcCat = data.breadcrumbs[data.breadcrumbs.length - 2]?.text;
+            if (bcCat && bcCat.toLowerCase() !== 'anasayfa' && bcCat.toLowerCase() !== 'home') data.blogCategories = [bcCat];
+        } else if (data.breadcrumbs.length === 1 && data.breadcrumbs[0]?.text && data.breadcrumbs[0]?.text.toLowerCase() !== 'anasayfa' && data.breadcrumbs[0]?.text.toLowerCase() !== 'home') {
+            data.blogCategories = [data.breadcrumbs[0].text];
+        }
     }
+  }
+  // Eğer hala kategori yoksa ve başlıkta ipucu varsa (product için)
+  if (pageTypeGuess === 'product' && !data.category && data.title?.includes('|')) {
+      const parts = data.title.split('|');
+      if (parts.length > 1) data.category = parts[1]?.trim();
   }
   if (pageTypeGuess === 'category' && !data.category && data.title) {
       data.category = data.title;
   }
 
-  const navLinkContainerSelectors = (siteSelectors?.navigationLinksContainers || []).concat(GENERAL_SELECTORS.navigationLinksContainers || []);
-  data.navigationLinks = extractSpecificLinks($, navLinkContainerSelectors, pageUrl);
-  if (data.navigationLinks.length === 0) data.navigationLinks = null;
 
-  const footerLinkContainerSelectors = (siteSelectors?.footerLinksContainers || []).concat(GENERAL_SELECTORS.footerLinksContainers || []);
-  data.footerLinks = extractSpecificLinks($, footerLinkContainerSelectors, pageUrl);
-  if (data.footerLinks.length === 0) data.footerLinks = null;
+  const imageSelectors = (siteSelectors?.productImages || []).concat(GENERAL_SELECTORS.productImages || []);
+  const extractedImages = extractImagesFromSelectors($, pageUrl, imageSelectors, 'article img, main img, .content img, figure img');
+  
+  let currentImages = data.images || [];
+  currentImages = [...currentImages, ...extractedImages];
+
+  if (data.ogImage && !currentImages.some(img => img.src === data.ogImage)) {
+    currentImages.push({ src: data.ogImage, alt: 'OG Image', hasAlt: true, width: null, height: null });
+  }
+  
+  const uniqueImageMap = new Map<string, ImageItem>();
+  currentImages.forEach(img => { if(img?.src && !uniqueImageMap.has(img.src)) uniqueImageMap.set(img.src, img); }); 
+  data.images = Array.from(uniqueImageMap.values());
+  if (data.images.length === 0) data.images = null;
+
+  if (!data.ogImage && data.images && data.images.length > 0) {
+      const firstGoodImage = data.images.find(img => img.src && !/logo|icon|avatar|banner|placeholder|favicon|svg|spinner|loader|dummy|ads|1x1|pixel|feed|badge|rating|captcha|thumb|pattern|background|bg|spacer|shield|overlay/i.test(img.src) && (img.width ? parseInt(img.width) > 100 : true) && (img.height ? parseInt(img.height) > 100 : true));
+      if (firstGoodImage) data.ogImage = firstGoodImage.src;
+      else if (data.images[0]?.src) data.ogImage = data.images[0].src; // Fallback to first image if no "good" one
+  }
+  
+  // Navigasyon ve Footer Linkleri
+  data.navigationLinks = extractSpecificLinks($, (siteSelectors?.navigationLinksContainers || []).concat(GENERAL_SELECTORS.navigationLinksContainers || []), pageUrl) || null;
+  data.footerLinks = extractSpecificLinks($, (siteSelectors?.footerLinksContainers || []).concat(GENERAL_SELECTORS.footerLinksContainers || []), pageUrl) || null;
   
   const linksData = extractPageLinks($, pageUrl);
   data.allLinks = linksData.allLinks.length > 0 ? linksData.allLinks : null;
   data.internalLinks = linksData.internalLinks.length > 0 ? linksData.internalLinks : null;
   data.externalLinks = linksData.externalLinks.length > 0 ? linksData.externalLinks : null;
 
-  // 7. AI İÇİN ANA METİN
-  // Mevcut mainTextContent çıkarma mantığı (cloning and cleaning)
+  // --- 6. AI İçin Ana Metin ---
   const $contentClone = $('body').clone();
   $contentClone.find(`
     header, footer, nav, aside, script, style, noscript, form, button, input, svg, iframe,
@@ -1018,36 +1017,35 @@ export async function extractBaseDataFromHtml(
     const element = $(el);
     const text = element.text().trim();
     const linksCount = element.find('a').length;
-    const childElements = element.children().length;
+    // const childElements = element.children().length; // Bu satır kullanılmıyor gibi
 
     if (text.length < 100 && linksCount > 2 && (text.length / (linksCount + 1)) < 20) {
       element.remove();
     }
-    if (text.length === 0 && childElements === 0 && !element.is('img')) {
-        element.remove();
-    }
+    // if (text.length === 0 && childElements === 0 && !element.is('img')) { // Bu da kullanılmıyor
+    //     element.remove();
+    // }
   });
   
-  // MODIFIED: Selectors for mainText
   let mainText = $contentClone.find('main').text() || 
                  $contentClone.find('article').text() || 
-                 $contentClone.find('.content').text() || 
-                 $contentClone.find('#content, #main, #Content, #Main').text() || 
+                 $contentClone.find('.content, #content, #main, .entry-content').text() || // Daha genel içerik seçicileri
                  $contentClone.text(); 
   
   data.mainTextContent = sanitizeText(mainText)?.replace(/\s{2,}/g, ' ').slice(0, 15000) || "";
+  data.rawHtmlLength = htmlContent.length;
 
-
-  // Fallback title/description from main text (existing logic)
+  // Fallback meta description from main text (eğer hala yoksa)
+  if (!data.metaDescription && data.mainTextContent && data.mainTextContent.length > 20) {
+    data.metaDescription = data.mainTextContent.substring(0, 160).split('\n')[0].trim();
+    if (data.metaDescription.length > 155) data.metaDescription = data.metaDescription.substring(0, data.metaDescription.lastIndexOf(' ') > 0 ? data.metaDescription.lastIndexOf(' ') : 155);
+    if (data.mainTextContent.length > 160 && data.metaDescription.length < 160 && !data.metaDescription.endsWith('...')) data.metaDescription += '...';
+  }
+  // Fallback title from main text (eğer hala yoksa veya "Başlık Yok" ise)
   if ((!data.title || data.title === 'Başlık Yok') && data.mainTextContent && data.mainTextContent.length > 10) {
     data.title = data.mainTextContent.substring(0, 70).split('\n')[0].trim();
     if (data.title.length > 65) data.title = data.title.substring(0, data.title.lastIndexOf(' ') > 0 ? data.title.lastIndexOf(' ') : 65);
     if (data.mainTextContent.length > 70 && data.title.length < 70) data.title += '...';
-  }
-  if (!data.metaDescription && data.mainTextContent && data.mainTextContent.length > 20) {
-    data.metaDescription = data.mainTextContent.substring(0, 160).split('\n')[0].trim();
-    if (data.metaDescription.length > 155) data.metaDescription = data.metaDescription.substring(0, data.metaDescription.lastIndexOf(' ') > 0 ? data.metaDescription.lastIndexOf(' ') : 155);
-    if (data.mainTextContent.length > 160 && data.metaDescription.length < 160) data.metaDescription += '...';
   }
 
   return data;

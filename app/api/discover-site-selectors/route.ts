@@ -137,7 +137,7 @@ async function askAiForAllTargetSelectors(
     htmlExtract: string,
     targets: typeof TARGET_SELECTOR_KEYS,
     requestId?: string
-): Promise<AiAllSelectorsResponse> {
+): Promise<AiAllSelectorsResponse | { error: string, isRateLimitError?: boolean, retryAfter?: number }> { // MODIFIED return type
     const targetDescriptions = targets.map(target => {
         let desc = `- For key "${target.key}" ("${target.description}"):`;
         if (target.expectedAttr) {
@@ -211,14 +211,16 @@ async function askAiForAllTargetSelectors(
                 parsedContent = JSON.parse(jsonMatch[1] || jsonMatch[2]);
             } catch (e) {
                 logError(e, '[AutoSelector] Gemini (all targets) JSON block parsing failed', { rawText: textContent.slice(0, 500), requestId });
-                return {}; 
+                // Consider if this should also return the new error object type
+                return { error: "Failed to parse AI response JSON block.", isRateLimitError: false }; 
             }
         } else {
             try {
                 parsedContent = JSON.parse(textContent); 
             } catch (e) {
                  logError(new Error('Gemini (all targets) response is not a JSON block and not direct JSON.'), '[AutoSelector] Gemini (all targets) no valid JSON', { preview: textContent.slice(0,500), requestId });
-                return {}; 
+                // Consider if this should also return the new error object type
+                return { error: "AI response was not valid JSON.", isRateLimitError: false };
             }
         }
         
@@ -255,20 +257,36 @@ async function askAiForAllTargetSelectors(
                 return validatedSelectors;
             } else {
                 logError(new Error('Gemini response parsed, but no valid target keys or selectors found.'), '[AutoSelector] Gemini (all targets) invalid JSON structure or empty/invalid selectors', {parsedContentPreview: JSON.stringify(parsedContent).substring(0,300), requestId});
-                return {};
+                // This returns an empty object, indicating AI responded but with no usable selectors.
+                // The POST handler will treat this as "no selectors found" rather than a hard error.
+                return {}; 
             }
         } else {
             logError(new Error('Gemini response parsed, but not a valid object for selectors.'), '[AutoSelector] Gemini (all targets) parsed content not an object', {parsedContentPreview: JSON.stringify(parsedContent).substring(0,300), requestId});
-            return {};
+            // Consider if this should also return the new error object type
+            return { error: "AI response was not a valid object structure.", isRateLimitError: false };
         }
 
-    } catch (e: any) {
+    } catch (e: any) { // MODIFIED catch block
         logError(e, '[AutoSelector] AI API call failed for ALL target selectors suggestion', { errorMessage: e.message, stack: e.stack?.substring(0,500), requestId });
-        if (e.message?.includes('429')) { 
+        let errorMessage = 'AI API call failed for selector suggestion.';
+        let isRateLimit = false;
+        let retryAfterSeconds: number | undefined;
+
+        if (e.message?.includes('429') || e.message?.toLowerCase().includes('rate limit exceeded') || e.message?.toLowerCase().includes('quota exceeded')) {
+            isRateLimit = true;
+            errorMessage = 'Google Gemini API rate limit aşıldı. Lütfen bir süre sonra tekrar deneyin veya kotanızı kontrol edin.';
+            
+            const retryMatch = e.message.match(/retryDelay":"(\d+)s"/); // Attempt to extract retryDelay
+            if (retryMatch && retryMatch[1]) {
+                retryAfterSeconds = parseInt(retryMatch[1], 10);
+                errorMessage += ` Yaklaşık ${retryAfterSeconds} saniye sonra tekrar deneyebilirsiniz.`;
+            }
+            // The existing delay mechanism for server-side pause
             addLog(`[AutoSelector] Rate limit hit (all targets). Waiting for ${AI_REQUEST_DELAY_DISCOVERY * 2 / 1000}s.`, {requestId, level: 'warn'});
             await delay(AI_REQUEST_DELAY_DISCOVERY * 2); 
         }
-        return {}; 
+        return { error: errorMessage, isRateLimitError: isRateLimit, retryAfter: retryAfterSeconds }; // Return detailed error object
     }
 }
 
@@ -426,8 +444,23 @@ export const POST = withCors(async function POST(req: NextRequest) {
     }
     addLog(`[AutoSelector] Selected representative sample for AI: ${representativeSampleUrl}`, {requestId});
 
-    // This is the line that caused the error. Now askAiForAllTargetSelectors is defined.
-    const initialAiSelectors: AiAllSelectorsResponse = await askAiForAllTargetSelectors(representativeSampleHtml, TARGET_SELECTOR_KEYS, requestId);
+    // MODIFIED to handle new error response structure
+    const initialAiSelectorsResponse = await askAiForAllTargetSelectors(representativeSampleHtml, TARGET_SELECTOR_KEYS, requestId);
+
+    if (initialAiSelectorsResponse && 'error' in initialAiSelectorsResponse) {
+        addLog(`[AutoSelector] AI could not propose initial selectors. Error: ${initialAiSelectorsResponse.error}`, {requestId, errorObj: initialAiSelectorsResponse});
+        return NextResponse.json({
+            error: initialAiSelectorsResponse.error,
+            isRateLimitError: initialAiSelectorsResponse.isRateLimitError,
+            retryAfter: initialAiSelectorsResponse.retryAfter,
+            hostname: siteHostname,
+            selectors: {}
+        }, { status: initialAiSelectorsResponse.isRateLimitError ? 429 : 500 });
+    }
+    
+    // Type assertion for successful response
+    const initialAiSelectors = initialAiSelectorsResponse as AiAllSelectorsResponse; 
+
     addLog(`[AutoSelector] AI proposed initial selectors for ${Object.keys(initialAiSelectors).length} keys based on ${representativeSampleUrl}.`, {requestId, keys: Object.keys(initialAiSelectors)});
 
     for (const target of TARGET_SELECTOR_KEYS) {
